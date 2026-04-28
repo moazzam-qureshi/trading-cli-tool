@@ -1,0 +1,25 @@
+[Unit]
+Description=trade-cli monitoring daemon (Discord alerts for Binance trades)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to match your VPS install
+User=trader
+WorkingDirectory=/home/trader/trading-workspace
+ExecStart=/home/trader/trading-workspace/venv/bin/python /home/trader/trading-workspace/daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/trader/trading-workspace/logs/daemon.stdout.log
+StandardError=append:/home/trader/trading-workspace/logs/daemon.stderr.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/trader/trading-workspace
+
+[Install]
+WantedBy=multi-user.target

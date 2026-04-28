@@ -1,0 +1,35 @@
+services:
+  trade-cli:
+    build: .
+    image: trade-cli:latest
+    container_name: trade-cli
+    restart: unless-stopped
+
+    # API keys + webhooks (never baked into image)
+    env_file:
+      - .env
+
+    # Persist mutable state across restarts/rebuilds
+    volumes:
+      - ./logs:/app/logs
+      - ./trade_notes:/app/trade_notes
+      - ./trades.csv:/app/trades.csv
+      - ./state.json:/app/state.json
+
+    # Optional: run a quick CLI command instead of the daemon
+    # docker compose run --rm trade-cli python trade.py status
+
+    # Resource limits — daemon is light, this prevents runaway loops
+    mem_limit: 512m
+    cpus: 0.5
+
+    # Stop signal handling — tini in the image already handles this
+    stop_grace_period: 15s
+
+    # Healthcheck: daemon should write to log within 2 min of starting
+    healthcheck:
+      test: ["CMD-SHELL", "find logs/daemon.log -mmin -3 | grep -q daemon.log"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

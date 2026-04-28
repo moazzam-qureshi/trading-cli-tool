@@ -1,0 +1,24 @@
+# Don't ship secrets or local state into the image
+.env
+.env.local
+.git
+.gitignore
+.claude/
+.vscode/
+
+# Python build artifacts
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Mutable state — mounted as volumes instead
+logs/
+trade_notes/
+trades.csv
+state.json
+
+# Docs / dev files
+README.md
+DEPLOY.md
+*.service
