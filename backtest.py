@@ -50,9 +50,11 @@ class SimTrade:
     rr: float
     exit_time: str = ""
     exit: float = 0.0
-    outcome: str = ""  # WIN / LOSS / OPEN / TIMEOUT
+    outcome: str = ""  # WIN / LOSS / OPEN / TIMEOUT / WIN_PARTIAL_BE / WIN_PARTIAL_TARGET
     r_multiple: float = 0.0
     bars_held: int = 0
+    partial_taken: bool = False
+    effective_stop: float = 0.0  # current stop (moves to BE after partial)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -86,6 +88,9 @@ def run_backtest(
     max_hold_bars: int = 96,  # 96 * 15m = 24h
     risk_pct: float = 2.0,
     starting_equity: float = 150.0,
+    partial_pct: float = 0.0,       # 0 = disabled. Else % of position to close at partial_at_r
+    partial_at_r: float = 1.0,
+    score_every_n: int = 1,         # only score every Nth bar (4 = once per hour) — big speedup
 ) -> dict:
     symbol = symbol.upper()
 
@@ -114,56 +119,85 @@ def run_backtest(
             high = float(bar["high"])
             low = float(bar["low"])
             held = i - open_idx
+            t = open_trade
+            risk_per = abs(t.entry - t.stop)
+            partial_trigger = (t.entry + partial_at_r * risk_per) if t.direction == "long" \
+                              else (t.entry - partial_at_r * risk_per)
+            partial_frac = partial_pct / 100.0
+            remainder_frac = 1 - partial_frac
 
-            hit_stop = False
-            hit_target = False
-            if open_trade.direction == "long":
-                if low <= open_trade.stop:
-                    hit_stop = True
-                if high >= open_trade.target:
-                    hit_target = True
+            def hit_long(level): return low <= level
+            def hit_short(level): return high >= level
+            def hit_above(level): return high >= level
+            def hit_below(level): return low <= level
+
+            if t.direction == "long":
+                stop_hit = hit_long(t.effective_stop)
+                target_hit = hit_above(t.target)
+                partial_hit = hit_above(partial_trigger) if partial_pct > 0 and not t.partial_taken else False
             else:
-                if high >= open_trade.stop:
-                    hit_stop = True
-                if low <= open_trade.target:
-                    hit_target = True
+                stop_hit = hit_short(t.effective_stop)
+                target_hit = hit_below(t.target)
+                partial_hit = hit_below(partial_trigger) if partial_pct > 0 and not t.partial_taken else False
 
-            # Conservative: if both hit on same bar, assume stop first
-            if hit_stop:
-                open_trade.exit_time = ts.isoformat()
-                open_trade.exit = open_trade.stop
-                open_trade.outcome = "LOSS"
-                open_trade.r_multiple = -1.0
-                open_trade.bars_held = held
-                trades.append(open_trade)
-                open_trade = None
-                continue
-            if hit_target:
-                open_trade.exit_time = ts.isoformat()
-                open_trade.exit = open_trade.target
-                open_trade.outcome = "WIN"
-                open_trade.r_multiple = open_trade.rr
-                open_trade.bars_held = held
-                trades.append(open_trade)
-                open_trade = None
-                continue
+            # Conservative same-bar ordering:
+            #   pre-partial:  stop > partial > target  (worst case)
+            #   post-partial: stop(BE) > target        (worst case)
+            if not t.partial_taken:
+                if stop_hit:
+                    t.exit_time = ts.isoformat(); t.exit = t.effective_stop
+                    t.outcome = "LOSS"; t.r_multiple = -1.0; t.bars_held = held
+                    trades.append(t); open_trade = None; continue
+                if partial_pct > 0 and partial_hit:
+                    # realize partial at +partial_at_r R, move stop to BE, keep going same bar
+                    t.partial_taken = True
+                    t.effective_stop = t.entry  # break-even
+                    # Same bar: did target also hit AFTER partial? (price went up to partial then to target)
+                    if target_hit:
+                        t.exit_time = ts.isoformat(); t.exit = t.target
+                        t.outcome = "WIN_PARTIAL_TARGET"
+                        t.r_multiple = round(partial_frac * partial_at_r + remainder_frac * t.rr, 3)
+                        t.bars_held = held
+                        trades.append(t); open_trade = None; continue
+                    # else: continue holding remainder with stop @ BE
+                    continue
+                if target_hit:
+                    t.exit_time = ts.isoformat(); t.exit = t.target
+                    t.outcome = "WIN"; t.r_multiple = t.rr; t.bars_held = held
+                    trades.append(t); open_trade = None; continue
+            else:
+                # partial already taken; stop is at BE, only target or BE-stop can close
+                if stop_hit:  # BE
+                    t.exit_time = ts.isoformat(); t.exit = t.effective_stop
+                    t.outcome = "WIN_PARTIAL_BE"
+                    t.r_multiple = round(partial_frac * partial_at_r, 3)  # remainder = 0R
+                    t.bars_held = held
+                    trades.append(t); open_trade = None; continue
+                if target_hit:
+                    t.exit_time = ts.isoformat(); t.exit = t.target
+                    t.outcome = "WIN_PARTIAL_TARGET"
+                    t.r_multiple = round(partial_frac * partial_at_r + remainder_frac * t.rr, 3)
+                    t.bars_held = held
+                    trades.append(t); open_trade = None; continue
             if held >= max_hold_bars:
-                # time-out exit at close
                 exit_p = float(bar["close"])
-                if open_trade.direction == "long":
-                    r = (exit_p - open_trade.entry) / (open_trade.entry - open_trade.stop)
+                risk0 = abs(t.entry - t.stop)  # original R denominator
+                if t.direction == "long":
+                    r_full = (exit_p - t.entry) / risk0
                 else:
-                    r = (open_trade.entry - exit_p) / (open_trade.stop - open_trade.entry)
-                open_trade.exit_time = ts.isoformat()
-                open_trade.exit = exit_p
-                open_trade.outcome = "TIMEOUT"
-                open_trade.r_multiple = round(r, 2)
-                open_trade.bars_held = held
-                trades.append(open_trade)
-                open_trade = None
+                    r_full = (t.entry - exit_p) / risk0
+                if t.partial_taken:
+                    r_total = partial_frac * partial_at_r + remainder_frac * r_full
+                else:
+                    r_total = r_full
+                t.exit_time = ts.isoformat(); t.exit = exit_p
+                t.outcome = "TIMEOUT"; t.r_multiple = round(r_total, 2); t.bars_held = held
+                trades.append(t); open_trade = None
             continue
 
         # ── no open trade — score this bar ──
+        if (i - warmup) % score_every_n != 0:
+            continue
         try:
             ltf_slice = ltf_df.iloc[: i + 1]
             mtf_slice = _slice_until(mtf_df, ts)
@@ -203,14 +237,19 @@ def run_backtest(
             score=r["score"],
             risk_pct=risk_pct,
             rr=rr,
+            effective_stop=stop,
         )
         open_idx = i + 1
 
     # ── compile stats ──
-    closed = [t for t in trades if t.outcome in ("WIN", "LOSS", "TIMEOUT")]
-    wins = [t for t in closed if t.outcome == "WIN"]
+    WIN_OUTCOMES = ("WIN", "WIN_PARTIAL_BE", "WIN_PARTIAL_TARGET")
+    closed = [t for t in trades if t.outcome in WIN_OUTCOMES + ("LOSS", "TIMEOUT")]
+    wins = [t for t in closed if t.outcome in WIN_OUTCOMES]
     losses = [t for t in closed if t.outcome == "LOSS"]
     timeouts = [t for t in closed if t.outcome == "TIMEOUT"]
+    win_full = len([t for t in closed if t.outcome == "WIN"])
+    win_partial_target = len([t for t in closed if t.outcome == "WIN_PARTIAL_TARGET"])
+    win_partial_be = len([t for t in closed if t.outcome == "WIN_PARTIAL_BE"])
 
     total_r = sum(t.r_multiple for t in closed)
     avg_r = total_r / len(closed) if closed else 0
@@ -240,6 +279,8 @@ def run_backtest(
             "max_hold_bars": max_hold_bars,
             "risk_pct": risk_pct,
             "starting_equity": starting_equity,
+            "partial_pct": partial_pct,
+            "partial_at_r": partial_at_r,
         },
         "period": {
             "from": ltf_df.index[0].isoformat(),
@@ -252,6 +293,9 @@ def run_backtest(
             "wins": len(wins),
             "losses": len(losses),
             "timeouts": len(timeouts),
+            "win_full": win_full,
+            "win_partial_target": win_partial_target,
+            "win_partial_be": win_partial_be,
             "win_rate_pct": round(win_rate, 1),
             "avg_r": round(avg_r, 2),
             "total_r": round(total_r, 2),
@@ -263,6 +307,23 @@ def run_backtest(
         },
         "trades": [asdict(t) for t in trades],
     }
+
+
+def run_score_sweep(client: Client, symbols: list[str], scores: list[int],
+                     bars_15m: int = 17500, **kwargs) -> dict:
+    """Run the same backtest config across multiple min_score thresholds and aggregate.
+
+    Useful for finding the score where edge appears.
+    """
+    out = {"per_score": {}}
+    for sc in scores:
+        agg = run_multi_backtest(client, symbols, bars_15m=bars_15m, min_score=sc, **kwargs)
+        out["per_score"][str(sc)] = agg["aggregate"]
+        out["per_score"][str(sc)]["per_symbol"] = {
+            s: {k: v for k, v in stats.items() if k != "trades"}
+            for s, stats in agg["by_symbol"].items()
+        }
+    return out
 
 
 def run_multi_backtest(client: Client, symbols: list[str], **kwargs) -> dict:

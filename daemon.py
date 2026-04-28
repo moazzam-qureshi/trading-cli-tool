@@ -262,8 +262,18 @@ class PositionMonitorJob(Job):
             rows = jrnl.list_trades(10000)
             row = next((r for r in rows if r["symbol"] == sym and r["outcome"] == "OPEN"), None)
             if row:
-                jrnl.close_trade(row["trade_id"], outcome, exit_p, round(pnl, 4), round(pnl_pct, 2),
+                # Prefer real net P&L from fills (includes fees)
+                try:
+                    net = jrnl.compute_net_pnl(client, sym, row["timestamp"])
+                    pnl_net = net["net_pnl_usdt"]
+                    cost_basis = net["buy_quote_usdt"] or (entry * qty)
+                    pnl_pct_net = pnl_net / cost_basis * 100 if cost_basis else pnl_pct
+                except Exception as e:
+                    log.warning(f"compute_net_pnl failed for {sym}: {e}")
+                    pnl_net, pnl_pct_net = pnl, pnl_pct
+                jrnl.close_trade(row["trade_id"], outcome, exit_p, round(pnl_net, 4), round(pnl_pct_net, 2),
                                  lesson="(auto-closed by daemon — fill in manually)")
+                pnl, pnl_pct = pnl_net, pnl_pct_net  # use net for the Discord post
                 notify.journal_post(
                     trade_id=row["trade_id"], symbol=sym, outcome=outcome,
                     exit_price=exit_p, pnl=pnl, pnl_pct=pnl_pct,

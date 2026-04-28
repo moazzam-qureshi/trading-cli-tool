@@ -158,7 +158,11 @@ def price(symbol: str) -> None:
 @click.option("--override-breaker", is_flag=True, help="Bypass the daily-loss circuit breaker (use with care)")
 @click.option("--partial-pct", type=float, default=None, help="%% of position to close at 1R (enables partial-TP + BE move)")
 @click.option("--partial-at-r", type=float, default=1.0, help="R-multiple at which to take partial (default 1.0)")
-def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker, partial_pct, partial_at_r):
+@click.option("--reason", default="", help="Reasoning for the trade (auto-filled from confluence_score if empty)")
+@click.option("--setup", default="", help="Setup type label (e.g. 'OB+sweep'). Auto-filled if empty.")
+@click.option("--no-journal", is_flag=True, help="Skip auto-journaling")
+def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker,
+        partial_pct, partial_at_r, reason, setup, no_journal):
     """Buy + auto-attach OCO (stop + take-profit)."""
     client = get_client()
     symbol = symbol.upper()
@@ -255,6 +259,52 @@ def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker,
                     result["partial_intent_saved"] = {"pct": partial_pct, "at_r": partial_at_r}
                 except Exception as e:
                     result["partial_intent_error"] = str(e)
+            # Auto-journal
+            if not no_journal:
+                try:
+                    avg_fill_j = float(Decimal(buy_order["cummulativeQuoteQty"]) / Decimal(buy_order["executedQty"]))
+                    qty_j = float(executed_qty)
+                    risk_usdt = abs(avg_fill_j - float(stop_d)) * qty_j
+                    reward_usdt = abs(float(target_d) - avg_fill_j) * qty_j
+                    j_reason = reason
+                    j_setup = setup
+                    j_score = ""
+                    if not j_reason or not j_setup:
+                        try:
+                            conf = analysis.confluence_score(client, symbol)
+                            if not j_reason:
+                                j_reason = " | ".join(conf.get("reasons", []))
+                            if not j_setup:
+                                # crude: setup label from highest-scoring confluences
+                                tags = []
+                                for r_text in conf.get("reasons", []):
+                                    if "OB" in r_text or "order block" in r_text: tags.append("OB")
+                                    if "FVG" in r_text: tags.append("FVG")
+                                    if "sweep" in r_text: tags.append("sweep")
+                                    if "Volume" in r_text or "volume" in r_text: tags.append("vol")
+                                j_setup = "+".join(dict.fromkeys(tags)) or "confluence"
+                            j_score = f"{conf.get('score','?')}/10"
+                        except Exception:
+                            pass
+                    tid = jrnl.log_entry({
+                        "symbol": symbol,
+                        "side": "BUY",
+                        "entry_price": avg_fill_j,
+                        "quantity": qty_j,
+                        "stop_loss": float(stop_d),
+                        "take_profit": float(target_d),
+                        "risk_usdt": round(risk_usdt, 4),
+                        "reward_usdt": round(reward_usdt, 4),
+                        "rr_ratio": round(reward_usdt / risk_usdt, 2) if risk_usdt else None,
+                        "setup_type": j_setup,
+                        "confluence_score": j_score,
+                        "reasoning": j_reason or "(no reason captured)",
+                        "buy_order_id": str(buy_order.get("orderId", "")),
+                        "oco_list_id": str(oco.get("orderListId", "")),
+                    })
+                    result["journal_id"] = tid
+                except Exception as e:
+                    result["journal_error"] = str(e)
             # Discord notification
             try:
                 avg_fill = float(Decimal(buy_order["cummulativeQuoteQty"]) / Decimal(buy_order["executedQty"]))
@@ -569,9 +619,11 @@ def setup_scan(quote, top, min_score, json_out):
 @click.option("--max-hold", default=96, help="Max bars to hold (96 = 24h on 15m)")
 @click.option("--risk-pct", default=2.0)
 @click.option("--equity", default=150.0, help="Starting equity for compounding sim")
+@click.option("--partial-pct", default=0.0, help="%% of position to close at partial_at_r (0=disabled)")
+@click.option("--partial-at-r", default=1.0)
 @click.option("--show-trades", is_flag=True, help="Print every simulated trade")
 @click.option("--json", "json_out", is_flag=True)
-def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, show_trades, json_out):
+def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, partial_pct, partial_at_r, show_trades, json_out):
     """Backtest the confluence strategy on historical data."""
     import backtest as bt
     client = get_client()
@@ -579,6 +631,7 @@ def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, show_trade
         client, symbol.upper(),
         bars_15m=bars, min_score=min_score, rr=rr,
         max_hold_bars=max_hold, risk_pct=risk_pct, starting_equity=equity,
+        partial_pct=partial_pct, partial_at_r=partial_at_r,
     )
     if json_out:
         out(result)
@@ -623,13 +676,16 @@ def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, show_trade
 @click.option("--bars", default=1500)
 @click.option("--min-score", default=8)
 @click.option("--rr", default=2.0)
+@click.option("--partial-pct", default=0.0)
+@click.option("--partial-at-r", default=1.0)
 @click.option("--json", "json_out", is_flag=True)
-def backtest_multi(symbols, bars, min_score, rr, json_out):
+def backtest_multi(symbols, bars, min_score, rr, partial_pct, partial_at_r, json_out):
     """Backtest across multiple symbols and aggregate."""
     import backtest as bt
     client = get_client()
     syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    result = bt.run_multi_backtest(client, syms, bars_15m=bars, min_score=min_score, rr=rr)
+    result = bt.run_multi_backtest(client, syms, bars_15m=bars, min_score=min_score, rr=rr,
+                                    partial_pct=partial_pct, partial_at_r=partial_at_r)
     if json_out:
         out(result)
         return
@@ -644,6 +700,46 @@ def backtest_multi(symbols, bars, min_score, rr, json_out):
     a = result["aggregate"]
     click.echo(f"\nAggregate: {a['total_trades']} trades, WR={a['win_rate_pct']}%, "
                f"avgR={a['avg_r']}, totalR={a['total_r']}")
+
+
+@cli.command(name="backtest-sweep")
+@click.option("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT")
+@click.option("--bars", default=17500, help="15m bars (17500 ≈ 6 months)")
+@click.option("--scores", default="8,9,10")
+@click.option("--rr", default=2.0)
+@click.option("--partial-pct", default=0.0)
+@click.option("--partial-at-r", default=1.0)
+@click.option("--score-every-n", default=4, help="Score every Nth 15m bar (4 = hourly, default for speed)")
+@click.option("--json", "json_out", is_flag=True)
+def backtest_sweep(symbols, bars, scores, rr, partial_pct, partial_at_r, score_every_n, json_out):
+    """Sweep min_score thresholds to find where edge appears."""
+    import backtest as bt
+    client = get_client()
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    score_list = [int(s) for s in scores.split(",")]
+    result = bt.run_score_sweep(client, syms, score_list,
+                                 bars_15m=bars, rr=rr,
+                                 partial_pct=partial_pct, partial_at_r=partial_at_r,
+                                 score_every_n=score_every_n)
+    if json_out:
+        out(result)
+        return
+    click.echo(f"\n=== Score sweep: {syms} ===")
+    click.echo(f"Bars/symbol: {bars} (~{bars*15//60//24} days)  RR={rr}  "
+               f"partial={partial_pct}%@{partial_at_r}R  score_every={score_every_n}\n")
+    click.echo(f"{'Score':>5}  {'Trades':>6}  {'WR%':>6}  {'avgR':>7}  {'totalR':>8}")
+    for sc, stats in result["per_score"].items():
+        click.echo(f"{sc:>5}  {stats['total_trades']:>6}  {stats['win_rate_pct']:>6.1f}  "
+                   f"{stats['avg_r']:>+7.2f}  {stats['total_r']:>+8.2f}")
+    click.echo("\nPer-symbol breakdown (lowest score):")
+    lowest = min(result["per_score"].keys(), key=int)
+    for sym, s in result["per_score"][lowest]["per_symbol"].items():
+        if "error" in s:
+            click.echo(f"  {sym:10s}  ERROR {s['error']}")
+            continue
+        click.echo(f"  {sym:10s}  closed={s.get('closed', 0):3d}  "
+                   f"WR={s.get('win_rate_pct', 0):5.1f}%  avgR={s.get('avg_r', 0):+.2f}  "
+                   f"return={s.get('return_pct', 0):+.1f}%")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -843,18 +939,38 @@ def journal_log(symbol, side, entry, quantity, stop, target, setup, score, reaso
 @click.option("--outcome", type=click.Choice(["WIN", "LOSS", "BE"]), required=True)
 @click.option("--exit", "exit_price", type=float, required=True)
 @click.option("--lesson", default="")
-def journal_close(trade_id, outcome, exit_price, lesson):
-    """Close a trade and update journal."""
+@click.option("--gross", is_flag=True, help="Use gross math instead of querying Binance fills for net")
+def journal_close(trade_id, outcome, exit_price, lesson, gross):
+    """Close a trade and update journal. Defaults to net P&L from real fills (incl. fees)."""
     rows = jrnl.list_trades(10000)
     row = next((r for r in rows if r["trade_id"] == trade_id), None)
     if not row:
         raise click.ClickException(f"Trade {trade_id} not found")
-    qty = float(row["quantity"])
-    entry = float(row["entry_price"])
-    pnl = (exit_price - entry) * qty if row["side"] == "BUY" else (entry - exit_price) * qty
-    pnl_pct = pnl / (entry * qty) * 100
+
+    if gross:
+        qty = float(row["quantity"])
+        entry = float(row["entry_price"])
+        pnl = (exit_price - entry) * qty if row["side"] == "BUY" else (entry - exit_price) * qty
+        pnl_pct = pnl / (entry * qty) * 100
+        fee_info = {}
+    else:
+        client = get_client()
+        try:
+            fee_info = jrnl.compute_net_pnl(client, row["symbol"], row["timestamp"])
+            pnl = fee_info["net_pnl_usdt"]
+            cost_basis = fee_info["buy_quote_usdt"] or (float(row["entry_price"]) * float(row["quantity"]))
+            pnl_pct = pnl / cost_basis * 100 if cost_basis else 0
+        except Exception as e:
+            click.echo(f"⚠ Net P&L lookup failed ({e}); falling back to gross math.", err=True)
+            qty = float(row["quantity"]); entry = float(row["entry_price"])
+            pnl = (exit_price - entry) * qty if row["side"] == "BUY" else (entry - exit_price) * qty
+            pnl_pct = pnl / (entry * qty) * 100
+            fee_info = {"error": str(e)}
+
     jrnl.close_trade(trade_id, outcome, exit_price, round(pnl, 4), round(pnl_pct, 2), lesson)
-    out({"trade_id": trade_id, "outcome": outcome, "pnl_usdt": round(pnl, 4), "pnl_pct": round(pnl_pct, 2)})
+    out({"trade_id": trade_id, "outcome": outcome,
+         "pnl_usdt": round(pnl, 4), "pnl_pct": round(pnl_pct, 2),
+         "fee_breakdown": fee_info})
 
 
 # ──────────────────────────────────────────────────────────────────

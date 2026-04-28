@@ -25,22 +25,47 @@ INTERVAL_MAP = {
 
 
 def fetch_klines(client: Client, symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
+    """Fetch klines. Paginates with endTime cursor when limit > 1000 (Binance per-call cap)."""
     iv = INTERVAL_MAP.get(interval.lower())
     if iv is None:
         raise ValueError(f"Bad interval: {interval}. Use {list(INTERVAL_MAP)}")
-    raw = client.get_klines(symbol=symbol.upper(), interval=iv, limit=limit)
-    df = pd.DataFrame(
-        raw,
-        columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_base", "taker_quote", "_",
-        ],
-    )
+
+    columns = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_base", "taker_quote", "_",
+    ]
+
+    if limit <= 1000:
+        raw = client.get_klines(symbol=symbol.upper(), interval=iv, limit=limit)
+    else:
+        # Walk backwards from "now" in 1000-bar chunks until we have `limit` bars
+        raw: list = []
+        end_time: Optional[int] = None
+        remaining = limit
+        while remaining > 0:
+            chunk_size = min(1000, remaining)
+            kwargs = {"symbol": symbol.upper(), "interval": iv, "limit": chunk_size}
+            if end_time is not None:
+                kwargs["endTime"] = end_time
+            chunk = client.get_klines(**kwargs)
+            if not chunk:
+                break
+            raw = chunk + raw  # prepend (we're going backwards)
+            # Next page ends 1ms before this chunk's first bar
+            end_time = int(chunk[0][0]) - 1
+            remaining -= len(chunk)
+            if len(chunk) < chunk_size:
+                break  # exchange returned less than asked → no more history
+
+    df = pd.DataFrame(raw, columns=columns)
     for c in ["open", "high", "low", "close", "volume", "quote_volume", "taker_base", "taker_quote"]:
         df[c] = df[c].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-    return df.set_index("open_time")
+    df = df.set_index("open_time")
+    # Dedup in case overlapping chunks; keep first
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    return df
 
 
 # ──────────────────────────────────────────────────────────────────

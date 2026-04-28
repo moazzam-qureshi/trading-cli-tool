@@ -119,6 +119,67 @@ def close_trade(trade_id: str, outcome: str, exit_price: float, pnl_usdt: float,
         note.write_text(text, encoding="utf-8")
 
 
+def compute_net_pnl(client, symbol: str, entry_ts_iso: str, exit_ts_iso: str | None = None) -> dict:
+    """Compute net P&L by walking get_my_trades fills between entry and exit timestamps.
+
+    Net = sum(sell quoteQty) - sum(buy quoteQty) - sum(commission in USDT-equivalent).
+    Fees in the base asset are valued at the trade's price.
+    Fees in BNB or other are best-effort (priced at current ticker).
+    """
+    entry_ms = int(datetime.fromisoformat(entry_ts_iso.replace("Z", "+00:00")).timestamp() * 1000)
+    exit_ms = (int(datetime.fromisoformat(exit_ts_iso.replace("Z", "+00:00")).timestamp() * 1000)
+               if exit_ts_iso else None)
+
+    fills = client.get_my_trades(symbol=symbol, limit=200)
+    base = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
+    quote = "USDT" if symbol.endswith("USDT") else "BUSD" if symbol.endswith("BUSD") else "USDC"
+
+    relevant = []
+    for f in fills:
+        t = int(f["time"])
+        if t < entry_ms - 5000:  # 5s grace
+            continue
+        if exit_ms and t > exit_ms + 5000:
+            continue
+        relevant.append(f)
+
+    buys = [f for f in relevant if f["isBuyer"]]
+    sells = [f for f in relevant if not f["isBuyer"]]
+
+    buy_quote = sum(float(f["quoteQty"]) for f in buys)
+    sell_quote = sum(float(f["quoteQty"]) for f in sells)
+
+    fee_usdt = 0.0
+    for f in relevant:
+        c = float(f["commission"])
+        if c == 0:
+            continue
+        asset = f["commissionAsset"]
+        if asset == quote:
+            fee_usdt += c
+        elif asset == base:
+            fee_usdt += c * float(f["price"])
+        else:
+            # e.g. BNB — best effort using current price
+            try:
+                p = float(client.get_symbol_ticker(symbol=f"{asset}{quote}")["price"])
+                fee_usdt += c * p
+            except Exception:
+                pass
+
+    gross = sell_quote - buy_quote
+    net = gross - fee_usdt
+    return {
+        "buy_quote_usdt": round(buy_quote, 4),
+        "sell_quote_usdt": round(sell_quote, 4),
+        "gross_pnl_usdt": round(gross, 4),
+        "fees_usdt": round(fee_usdt, 4),
+        "net_pnl_usdt": round(net, 4),
+        "buy_fills": len(buys),
+        "sell_fills": len(sells),
+    }
+
+
 def list_trades(limit: int = 20) -> list[dict]:
     if not JOURNAL_PATH.exists():
         return []
