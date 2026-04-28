@@ -1,7 +1,11 @@
 """Trade journal — auto-logs every trade with reasoning + post-mortem template."""
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 from pathlib import Path
 
 JOURNAL_PATH = Path(__file__).parent / "trades.csv"
@@ -25,11 +29,11 @@ def _ensure_csv() -> None:
 def log_entry(data: dict) -> str:
     """Log a new trade entry. Returns trade_id."""
     _ensure_csv()
-    trade_id = data.get("trade_id") or datetime.utcnow().strftime("T%Y%m%d-%H%M%S")
+    trade_id = data.get("trade_id") or _utcnow().strftime("T%Y%m%d-%H%M%S")
     row = {f: "" for f in FIELDS}
     row.update(data)
     row["trade_id"] = trade_id
-    row["timestamp"] = datetime.utcnow().isoformat()
+    row["timestamp"] = _utcnow().isoformat()
     row["outcome"] = "OPEN"
 
     with open(JOURNAL_PATH, "a", newline="", encoding="utf-8") as f:

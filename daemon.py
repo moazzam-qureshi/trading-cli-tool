@@ -21,7 +21,11 @@ import signal
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
@@ -320,7 +324,7 @@ class SetupScannerJob(Job):
         log.info(f"Scanner found {len(results)} setups, {len(new_setups)} are fresh alerts")
 
         if new_setups:
-            lines = [f"**A+ Setup Scan — {datetime.utcnow().strftime('%H:%M UTC')}**"]
+            lines = [f"**A+ Setup Scan — {utcnow().strftime('%H:%M UTC')}**"]
             for r in new_setups[:10]:
                 arrow = "🟢" if r["direction"] == "long" else "🔴"
                 lines.append(f"{arrow} **{r['symbol']}** — {r['score']}/10 — {r['direction']} @ ${r['current_price']}")
@@ -345,7 +349,7 @@ class DailyReportJob(Job):
         self.target_hour = int(os.getenv("DAEMON_DAILY_REPORT_HOUR_UTC", 0))
 
     def run(self, ctx: dict) -> None:
-        now = datetime.utcnow()
+        now = utcnow()
         state: dict = ctx["state"]
         last_sent_date = state.get("last_daily_report_date")
         today_str = now.strftime("%Y-%m-%d")
@@ -392,7 +396,7 @@ class StartupJob(Job):
             open_orders = "?"
         notify.system_alert("INFO",
                             f"trade-cli daemon online",
-                            f"Started {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
+                            f"Started {utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
                             f"USDT: ${usdt['free']}\nOpen orders: {open_orders}")
         log.info("Daemon startup notification sent")
 

@@ -8,7 +8,7 @@ Multiple named channels supported via .env:
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -54,7 +54,7 @@ def _embed(title: str, description: str = "", color: str = "blue", fields: Optio
         "description": description[:2000],
         "color": COLORS.get(color, COLORS["blue"]),
         "fields": fields or [],
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer": {"text": "trade-cli"},
     }
 
