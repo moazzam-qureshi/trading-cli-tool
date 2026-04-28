@@ -404,6 +404,122 @@ def analyze_symbol(client: Client, symbol: str, interval: str = "1h", limit: int
 # Confluence score (the A+ setup grader)
 # ──────────────────────────────────────────────────────────────────
 
+def _analyze_df(df: pd.DataFrame, interval: str) -> dict:
+    """Same as analyze_symbol but operates on a pre-fetched dataframe (for backtests)."""
+    close = df["close"]
+    last = float(close.iloc[-1])
+
+    rsi_v = float(rsi(close).iloc[-1])
+    macd_l, sig_l, hist = macd(close)
+    bb_u, bb_m, bb_l = bollinger(close)
+    atr_v = float(atr(df).iloc[-1])
+    adx_v, p_di, m_di = adx(df)
+
+    swings = detect_swings(df)
+    structure = structure_summary(swings, last)
+    liquidity = find_liquidity(swings)
+    sweep = detect_sweep(df, swings)
+    obs = detect_order_blocks(df)
+    fvgs = detect_fvg(df)
+
+    vol_avg20 = float(df["volume"].rolling(20).mean().iloc[-1])
+    vol_now = float(df["volume"].iloc[-1])
+    vol_ratio = round(vol_now / vol_avg20, 2) if vol_avg20 else None
+
+    return {
+        "interval": interval,
+        "current_price": last,
+        "indicators": {
+            "rsi": round(rsi_v, 2),
+            "atr": atr_v,
+            "adx": round(float(adx_v.iloc[-1]), 2),
+            "volume_ratio_vs_20avg": vol_ratio,
+        },
+        "structure": structure,
+        "swings": swings,
+        "liquidity": liquidity,
+        "recent_sweep": sweep,
+        "order_blocks": obs,
+        "fvg": fvgs,
+    }
+
+
+def score_from_dfs(htf_df: pd.DataFrame, mtf_df: pd.DataFrame, ltf_df: pd.DataFrame) -> dict:
+    """Confluence scoring against pre-sliced dataframes — used by backtest + live scoring."""
+    htf = _analyze_df(htf_df, "4h")
+    mtf = _analyze_df(mtf_df, "1h")
+    ltf = _analyze_df(ltf_df, "15m")
+
+    score = 0
+    reasons: list[str] = []
+    direction = None
+
+    htf_trend = htf["structure"]["trend"]
+    if htf_trend == "Bullish":
+        direction = "long"
+        score += 3
+        reasons.append("HTF (4H) bullish")
+    elif htf_trend == "Bearish":
+        direction = "short"
+        score += 3
+        reasons.append("HTF (4H) bearish")
+
+    if direction:
+        sweep = mtf.get("recent_sweep")
+        if sweep:
+            want = "bullish_sweep" if direction == "long" else "bearish_sweep"
+            if sweep["type"] == want:
+                score += 3
+                reasons.append(f"MTF {sweep['type']}")
+
+        obs = mtf["order_blocks"]
+        bucket = obs["bullish"] if direction == "long" else obs["bearish"]
+        price = mtf["current_price"]
+        for ob in bucket:
+            if ob["low"] <= price <= ob["high"]:
+                score += 2
+                reasons.append("Inside OB on 1H")
+                break
+
+        fvgs = mtf["fvg"]
+        bucket_fvg = fvgs["bullish"] if direction == "long" else fvgs["bearish"]
+        for fvg in bucket_fvg:
+            if fvg["low"] <= price <= fvg["high"] and not fvg["filled"]:
+                score += 2
+                reasons.append("Inside unfilled FVG on 1H")
+                break
+
+        ltf_struct = ltf["structure"]["trend"]
+        if (direction == "long" and ltf_struct == "Bullish") or (direction == "short" and ltf_struct == "Bearish"):
+            score += 2
+            reasons.append(f"LTF aligned ({ltf_struct})")
+
+        vol = ltf["indicators"]["volume_ratio_vs_20avg"]
+        if vol and vol > 1.5:
+            score += 1
+            reasons.append(f"Volume spike ({vol}x)")
+
+        rsi_ltf = ltf["indicators"]["rsi"]
+        if direction == "long" and 30 < rsi_ltf < 60:
+            score += 1
+            reasons.append(f"RSI healthy long ({rsi_ltf})")
+        elif direction == "short" and 40 < rsi_ltf < 70:
+            score += 1
+            reasons.append(f"RSI healthy short ({rsi_ltf})")
+
+    return {
+        "direction": direction,
+        "score": score,
+        "reasons": reasons,
+        "htf_trend": htf_trend,
+        "mtf_trend": mtf["structure"]["trend"],
+        "ltf_trend": ltf["structure"]["trend"],
+        "current_price": ltf["current_price"],
+        "ltf_atr": ltf["indicators"]["atr"],
+        "ltf_swings": ltf["swings"],
+    }
+
+
 def confluence_score(client: Client, symbol: str) -> dict:
     """Score a symbol for A+ setup probability across multiple TFs."""
     htf = analyze_symbol(client, symbol, "4h", 300)

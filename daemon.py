@@ -277,6 +277,130 @@ class PositionMonitorJob(Job):
 
 
 # ──────────────────────────────────────────────────────────────────
+# PartialTPJob — execute partial profit + move stop to BE when 1R hit
+# ──────────────────────────────────────────────────────────────────
+
+class PartialTPJob(Job):
+    """Watches state.partial_tp_intents. When current price reaches the partial
+    trigger, cancels OCO, sells partial_pct%, re-places OCO with stop at BE."""
+    name = "partial_tp"
+
+    def __init__(self):
+        super().__init__()
+        self.interval = int(os.getenv("DAEMON_PARTIAL_TP_INTERVAL", 30))
+
+    def run(self, ctx: dict) -> None:
+        client: Client = ctx["client"]
+        state: dict = ctx["state"]
+        intents: dict = state.setdefault("partial_tp_intents", {})
+        if not intents:
+            return
+
+        from decimal import Decimal, ROUND_DOWN
+
+        for sym in list(intents.keys()):
+            intent = intents[sym]
+            if intent.get("executed"):
+                continue
+
+            open_orders = client.get_open_orders(symbol=sym)
+            if not open_orders:
+                # position is closed already (TP/stop hit before partial trigger)
+                log.info(f"PartialTP: {sym} no longer has open orders — clearing intent")
+                intents.pop(sym, None)
+                continue
+
+            try:
+                price = float(client.get_symbol_ticker(symbol=sym)["price"])
+            except Exception as e:
+                log.warning(f"PartialTP: price fetch failed for {sym}: {e}")
+                continue
+
+            trigger = float(intent["partial_price"])
+            entry = float(intent["entry"])
+            is_long = entry < trigger  # we only support spot longs
+            hit = price >= trigger if is_long else price <= trigger
+            if not hit:
+                continue
+
+            log.info(f"PartialTP: {sym} hit partial trigger {trigger} (price {price})")
+            try:
+                self._execute(client, sym, intent)
+                intent["executed"] = True
+                intents[sym] = intent
+                save_state(state)
+                notify.send("signals",
+                            content=f"💰 **{sym}** partial TP @ ${price:.4f} — {intent['partial_pct']}% closed, "
+                                    f"stop moved to break-even (${entry:.4f}).")
+            except Exception as e:
+                log.error(f"PartialTP execution failed for {sym}: {e}\n{traceback.format_exc()}")
+                notify.system_alert("ERROR", f"Partial TP failed: {sym}", str(e)[:800])
+
+        save_state(state)
+
+    @staticmethod
+    def _execute(client: Client, sym: str, intent: dict) -> None:
+        from decimal import Decimal, ROUND_DOWN
+
+        info = client.get_symbol_info(sym)
+        filt = {f["filterType"]: f for f in info["filters"]}
+        lot = Decimal(filt["LOT_SIZE"]["stepSize"])
+        tick = Decimal(filt["PRICE_FILTER"]["tickSize"])
+
+        def round_step(value: Decimal, step: Decimal) -> Decimal:
+            if step == 0:
+                return value
+            return (value / step).quantize(Decimal("1"), rounding=ROUND_DOWN) * step
+
+        def fmt(v: Decimal, step: Decimal) -> str:
+            decimals = max(0, -step.as_tuple().exponent)
+            return f"{v:.{decimals}f}"
+
+        entry = Decimal(str(intent["entry"]))
+        target = Decimal(str(intent["target"]))
+        partial_pct = Decimal(str(intent["partial_pct"]))
+
+        # 1) Cancel current OCO (both legs)
+        for o in client.get_open_orders(symbol=sym):
+            try:
+                client.cancel_order(symbol=sym, orderId=o["orderId"])
+            except Exception:
+                pass
+
+        # 2) Determine free balance now
+        base = sym.replace("USDT", "").replace("BUSD", "")
+        bal = client.get_asset_balance(asset=base)
+        free_qty = round_step(Decimal(bal["free"]), lot)
+        if free_qty <= 0:
+            raise RuntimeError(f"No free {base} after cancel")
+
+        partial_qty = round_step(free_qty * partial_pct / Decimal("100"), lot)
+        remaining = round_step(free_qty - partial_qty, lot)
+
+        # 3) Market sell the partial portion
+        if partial_qty > 0:
+            client.order_market_sell(symbol=sym, quantity=fmt(partial_qty, lot))
+
+        # 4) Re-place OCO on remainder with stop at BE (entry) and original target
+        if remaining > 0:
+            be_stop = round_step(entry, tick)
+            be_stop_limit = round_step(be_stop * (Decimal("1") - Decimal("0.005")), tick)  # 0.5% slip
+            tp = round_step(target, tick)
+            params = {
+                "symbol": sym,
+                "side": "SELL",
+                "quantity": fmt(remaining, lot),
+                "aboveType": "LIMIT_MAKER",
+                "abovePrice": fmt(tp, tick),
+                "belowType": "STOP_LOSS_LIMIT",
+                "belowStopPrice": fmt(be_stop, tick),
+                "belowPrice": fmt(be_stop_limit, tick),
+                "belowTimeInForce": "GTC",
+            }
+            client._post("orderList/oco", True, data=params)
+
+
+# ──────────────────────────────────────────────────────────────────
 # SetupScannerJob — periodic A+ setup scans
 # ──────────────────────────────────────────────────────────────────
 
@@ -432,6 +556,7 @@ def main() -> None:
     jobs: list[Job] = [
         StartupJob(),
         PositionMonitorJob(),
+        PartialTPJob(),
         SetupScannerJob(),
         DailyReportJob(),
     ]

@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app code
-COPY analysis.py daemon.py display.py journal.py notify.py trade.py ./
+COPY analysis.py backtest.py daemon.py display.py journal.py notify.py risk.py trade.py ./
 
 # Persistent dirs (mounted as volumes at runtime)
 RUN mkdir -p logs trade_notes && \

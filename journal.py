@@ -21,7 +21,8 @@ FIELDS = [
 
 
 def _ensure_csv() -> None:
-    if not JOURNAL_PATH.exists():
+    # Write header if file is missing OR empty (handles bind-mounted empty files)
+    if not JOURNAL_PATH.exists() or JOURNAL_PATH.stat().st_size == 0:
         with open(JOURNAL_PATH, "w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=FIELDS).writeheader()
 
@@ -123,6 +124,66 @@ def list_trades(limit: int = 20) -> list[dict]:
         return []
     rows = list(csv.DictReader(open(JOURNAL_PATH, encoding="utf-8")))
     return rows[-limit:]
+
+
+def _agg(rows: list[dict]) -> dict:
+    """Aggregate a list of closed-trade rows into win/loss/avg-R."""
+    wins = [r for r in rows if r["outcome"] == "WIN"]
+    losses = [r for r in rows if r["outcome"] == "LOSS"]
+    bes = [r for r in rows if r["outcome"] == "BE"]
+    decisive = len(wins) + len(losses)
+    pnl = sum(float(r.get("pnl_usdt") or 0) for r in rows)
+    # avg R = total P&L USDT divided by total risk USDT
+    total_risk = sum(float(r.get("risk_usdt") or 0) for r in rows)
+    avg_r = pnl / total_risk if total_risk > 0 else 0
+    return {
+        "n": len(rows),
+        "wins": len(wins),
+        "losses": len(losses),
+        "be": len(bes),
+        "win_rate_pct": round(len(wins) / decisive * 100, 1) if decisive else 0,
+        "total_pnl_usdt": round(pnl, 2),
+        "avg_r": round(avg_r, 2),
+    }
+
+
+def stats_breakdown() -> dict:
+    """Per-setup, per-symbol, per-hour breakdowns. Helps surface personal edge."""
+    rows = list_trades(10000)
+    closed = [r for r in rows if r["outcome"] in ("WIN", "LOSS", "BE")]
+    if not closed:
+        return {"closed": 0, "note": "No closed trades yet"}
+
+    by_setup: dict[str, list[dict]] = {}
+    by_symbol: dict[str, list[dict]] = {}
+    by_hour: dict[int, list[dict]] = {}
+    by_score: dict[str, list[dict]] = {}
+    by_dow: dict[str, list[dict]] = {}
+
+    DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    for r in closed:
+        by_setup.setdefault(r.get("setup_type") or "?", []).append(r)
+        by_symbol.setdefault(r.get("symbol") or "?", []).append(r)
+        score = r.get("confluence_score") or "?"
+        by_score.setdefault(str(score), []).append(r)
+        try:
+            ts = r["timestamp"]
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+            if dt:
+                by_hour.setdefault(dt.hour, []).append(r)
+                by_dow.setdefault(DOW[dt.weekday()], []).append(r)
+        except Exception:
+            pass
+
+    return {
+        "closed": len(closed),
+        "overall": _agg(closed),
+        "by_setup": {k: _agg(v) for k, v in by_setup.items()},
+        "by_symbol": {k: _agg(v) for k, v in by_symbol.items()},
+        "by_score": {k: _agg(v) for k, v in by_score.items()},
+        "by_hour_utc": {str(k): _agg(v) for k, v in sorted(by_hour.items())},
+        "by_day_of_week": {k: _agg(v) for k, v in by_dow.items()},
+    }
 
 
 def stats() -> dict:

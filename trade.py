@@ -21,6 +21,7 @@ import analysis
 import journal as jrnl
 import display
 import notify
+import risk
 
 load_dotenv()
 
@@ -75,6 +76,43 @@ def fmt(value: Decimal, step: Decimal) -> str:
     return f"{value:.{decimals}f}"
 
 
+_STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+
+
+def _load_state() -> dict:
+    try:
+        with open(_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    with open(_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+def _save_partial_intent(symbol: str, entry: float, stop: float, target: float,
+                         qty: float, partial_pct: float, partial_at_r: float) -> None:
+    """Daemon's PartialTPJob picks this up and acts when 1R is hit."""
+    state = _load_state()
+    intents = state.setdefault("partial_tp_intents", {})
+    risk_per = entry - stop
+    partial_price = entry + partial_at_r * risk_per
+    intents[symbol] = {
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "qty": qty,
+        "partial_pct": partial_pct,
+        "partial_at_r": partial_at_r,
+        "partial_price": partial_price,
+        "executed": False,
+        "created_at": __import__("time").time(),
+    }
+    _save_state(state)
+
+
 @click.group()
 def cli() -> None:
     """trade-cli — Binance Spot trading helper."""
@@ -117,11 +155,24 @@ def price(symbol: str) -> None:
 @click.option("--target", type=float, required=True, help="Take-profit price")
 @click.option("--slip", type=float, default=0.5, help="Stop-limit slippage % below stop (default 0.5)")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt")
-def buy(symbol, usd, quantity, entry, stop, target, slip, yes):
+@click.option("--override-breaker", is_flag=True, help="Bypass the daily-loss circuit breaker (use with care)")
+@click.option("--partial-pct", type=float, default=None, help="%% of position to close at 1R (enables partial-TP + BE move)")
+@click.option("--partial-at-r", type=float, default=1.0, help="R-multiple at which to take partial (default 1.0)")
+def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker, partial_pct, partial_at_r):
     """Buy + auto-attach OCO (stop + take-profit)."""
     client = get_client()
     symbol = symbol.upper()
     filters = get_filters(client, symbol)
+
+    # Circuit breaker check
+    acc = client.get_account()
+    free_usdt = float(next((b for b in acc["balances"] if b["asset"] == "USDT"), {"free": "0"})["free"])
+    # rough total (USDT + held positions estimated at last price) — use just free for breaker, conservative
+    breaker = risk.check_trading_allowed(account_value=max(free_usdt, 1.0))
+    if not breaker["allowed"] and not override_breaker:
+        out({"error": "Trading paused by circuit breaker", **breaker,
+             "hint": "Use --override-breaker to bypass (don't, unless you have a really good reason)."})
+        sys.exit(2)
 
     lot = Decimal(filters["LOT_SIZE"]["stepSize"])
     tick = Decimal(filters["PRICE_FILTER"]["tickSize"])
@@ -195,6 +246,15 @@ def buy(symbol, usd, quantity, entry, stop, target, slip, yes):
                 stop_limit=fmt(stop_limit_d, tick),
             )
             result["oco"] = oco
+            # Persist partial-TP intent for daemon
+            if partial_pct:
+                try:
+                    avg_fill_p = float(Decimal(buy_order["cummulativeQuoteQty"]) / Decimal(buy_order["executedQty"]))
+                    _save_partial_intent(symbol, avg_fill_p, float(stop_d), float(target_d),
+                                          float(executed_qty), partial_pct, partial_at_r)
+                    result["partial_intent_saved"] = {"pct": partial_pct, "at_r": partial_at_r}
+                except Exception as e:
+                    result["partial_intent_error"] = str(e)
             # Discord notification
             try:
                 avg_fill = float(Decimal(buy_order["cummulativeQuoteQty"]) / Decimal(buy_order["executedQty"]))
@@ -498,6 +558,95 @@ def setup_scan(quote, top, min_score, json_out):
 
 
 # ──────────────────────────────────────────────────────────────────
+# Backtest
+# ──────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("symbol")
+@click.option("--bars", default=1500, help="15m bars to test (1500 ≈ 16 days)")
+@click.option("--min-score", default=8)
+@click.option("--rr", default=2.0, help="Reward:risk multiple")
+@click.option("--max-hold", default=96, help="Max bars to hold (96 = 24h on 15m)")
+@click.option("--risk-pct", default=2.0)
+@click.option("--equity", default=150.0, help="Starting equity for compounding sim")
+@click.option("--show-trades", is_flag=True, help="Print every simulated trade")
+@click.option("--json", "json_out", is_flag=True)
+def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, show_trades, json_out):
+    """Backtest the confluence strategy on historical data."""
+    import backtest as bt
+    client = get_client()
+    result = bt.run_backtest(
+        client, symbol.upper(),
+        bars_15m=bars, min_score=min_score, rr=rr,
+        max_hold_bars=max_hold, risk_pct=risk_pct, starting_equity=equity,
+    )
+    if json_out:
+        out(result)
+        return
+    if "error" in result:
+        click.echo(json.dumps(result, indent=2))
+        return
+    s = result["stats"]
+    p = result["period"]
+    click.echo(f"\n=== Backtest {result['symbol']} ===")
+    click.echo(f"Period: {p['from'][:10]} → {p['to'][:10]} ({p['days']} days)")
+    click.echo(f"Config: min_score={min_score} RR={rr} risk={risk_pct}% max_hold={max_hold} bars\n")
+    click.echo(f"Signals:        {s['total_signals']}")
+    click.echo(f"Closed:         {s['closed']}  (W:{s['wins']} L:{s['losses']} T:{s['timeouts']})")
+    click.echo(f"Win rate:       {s['win_rate_pct']}%")
+    click.echo(f"Avg R:          {s['avg_r']}")
+    click.echo(f"Total R:        {s['total_r']}")
+    click.echo(f"Profit factor:  {s['profit_factor']}")
+    click.echo(f"Equity:         ${s['starting_equity']} → ${s['final_equity']} ({s['return_pct']:+.1f}%)")
+    click.echo(f"Max drawdown:   {s['max_drawdown_pct']}%\n")
+
+    # Verdict
+    if s["closed"] < 10:
+        click.echo("⚠ Too few trades for statistical significance (need ≥ 30)")
+    elif s["avg_r"] > 0.3 and s["win_rate_pct"] > 35:
+        click.echo("✓ Edge looks real — strategy is profitable on this sample")
+    elif s["avg_r"] > 0:
+        click.echo("~ Marginal edge — try higher min_score or different symbols")
+    else:
+        click.echo("✗ No edge on this sample — current rules lose money here")
+
+    if show_trades:
+        click.echo("\n--- Trades ---")
+        for t in result["trades"]:
+            click.echo(f"  {t['entry_time'][:16]} {t['direction']:5s} score={t['score']} "
+                       f"entry={t['entry']:.4f} stop={t['stop']:.4f} target={t['target']:.4f} "
+                       f"→ {t['outcome']:7s} R={t['r_multiple']:+.2f}")
+
+
+@cli.command(name="backtest-multi")
+@click.option("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")
+@click.option("--bars", default=1500)
+@click.option("--min-score", default=8)
+@click.option("--rr", default=2.0)
+@click.option("--json", "json_out", is_flag=True)
+def backtest_multi(symbols, bars, min_score, rr, json_out):
+    """Backtest across multiple symbols and aggregate."""
+    import backtest as bt
+    client = get_client()
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    result = bt.run_multi_backtest(client, syms, bars_15m=bars, min_score=min_score, rr=rr)
+    if json_out:
+        out(result)
+        return
+    click.echo("\n=== Multi-symbol backtest ===")
+    for sym, s in result["by_symbol"].items():
+        if "error" in s:
+            click.echo(f"  {sym:10s} ERROR {s['error']}")
+            continue
+        click.echo(f"  {sym:10s} closed={s['closed']:3d}  WR={s['win_rate_pct']:5.1f}%  "
+                   f"avgR={s['avg_r']:+.2f}  totalR={s['total_r']:+.2f}  "
+                   f"return={s['return_pct']:+.1f}%")
+    a = result["aggregate"]
+    click.echo(f"\nAggregate: {a['total_trades']} trades, WR={a['win_rate_pct']}%, "
+               f"avgR={a['avg_r']}, totalR={a['total_r']}")
+
+
+# ──────────────────────────────────────────────────────────────────
 # Risk / Position sizing
 # ──────────────────────────────────────────────────────────────────
 
@@ -620,6 +769,38 @@ def journal_stats(json_out):
         out(data)
     else:
         display.render_journal_stats(data)
+
+
+@journal.command(name="analyze")
+@click.option("--json", "json_out", is_flag=True)
+def journal_analyze(json_out):
+    """Per-setup / symbol / hour-of-day / score breakdowns to surface edge."""
+    data = jrnl.stats_breakdown()
+    if json_out:
+        out(data)
+        return
+    if data.get("closed", 0) == 0:
+        click.echo("No closed trades yet.")
+        return
+    o = data["overall"]
+    click.echo(f"\n=== Overall ({o['n']} closed) ===")
+    click.echo(f"  Win rate: {o['win_rate_pct']}%   Avg R: {o['avg_r']:+.2f}   P&L: ${o['total_pnl_usdt']:+.2f}")
+
+    def render(title: str, group: dict):
+        click.echo(f"\n--- {title} ---")
+        rows = sorted(group.items(), key=lambda kv: kv[1]["n"], reverse=True)
+        for k, s in rows:
+            if s["n"] == 0:
+                continue
+            click.echo(f"  {str(k):14s}  n={s['n']:3d}  W={s['wins']:2d} L={s['losses']:2d}  "
+                       f"WR={s['win_rate_pct']:5.1f}%  avgR={s['avg_r']:+.2f}  "
+                       f"P&L=${s['total_pnl_usdt']:+.2f}")
+
+    render("By setup", data["by_setup"])
+    render("By symbol", data["by_symbol"])
+    render("By confluence score", data["by_score"])
+    render("By hour of day (UTC)", data["by_hour_utc"])
+    render("By day of week", data["by_day_of_week"])
 
 
 @journal.command(name="log")
@@ -782,6 +963,28 @@ def monitor(symbol, interval, heartbeat, alert_near_pct, max_runtime):
             display.console.print(f"[dim]Heartbeat sent — price ${price} / structure {current_struct}[/]")
 
         time.sleep(interval)
+
+
+@cli.command(name="risk-check")
+@click.option("--json", "json_out", is_flag=True)
+def risk_check(json_out):
+    """Show today's loss budget and circuit-breaker status."""
+    client = get_client()
+    bal = client.get_asset_balance(asset="USDT")
+    free = float(bal["free"])
+    info = risk.check_trading_allowed(account_value=max(free, 1.0))
+    if json_out:
+        out(info)
+    else:
+        click.echo(f"\nDate: {info['today']}")
+        click.echo(f"Trades closed today: {info['trades_closed_today']}")
+        click.echo(f"  · Losses: {info['losses_today']} / {info['max_losses']}")
+        click.echo(f"  · P&L:    ${info['pnl_today_usdt']:+.2f}")
+        click.echo(f"  · DD:     {info['drawdown_today_pct']}% / {info['max_dd_pct']}%")
+        status = "✓ ALLOWED" if info["allowed"] else "✗ BLOCKED"
+        click.echo(f"\nNew trades: {status}")
+        if not info["allowed"]:
+            click.echo(f"Reason: {info['reason']}")
 
 
 @cli.command()
