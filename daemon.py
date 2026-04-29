@@ -264,7 +264,9 @@ class PositionMonitorJob(Job):
             if row:
                 # Prefer real net P&L from fills (includes fees)
                 try:
-                    net = jrnl.compute_net_pnl(client, sym, row["timestamp"])
+                    net = jrnl.compute_net_pnl(client, sym, row["timestamp"],
+                                                buy_order_id=row.get("buy_order_id", ""),
+                                                oco_list_id=row.get("oco_list_id", ""))
                     pnl_net = net["net_pnl_usdt"]
                     cost_basis = net["buy_quote_usdt"] or (entry * qty)
                     pnl_pct_net = pnl_net / cost_basis * 100 if cost_basis else pnl_pct
@@ -417,7 +419,21 @@ class PartialTPJob(Job):
 PRIMARY_SYMBOLS = {"BTCUSDT", "SOLUSDT", "BNBUSDT"}  # validated edge in 6mo backtest
 TARGET_RR = float(os.getenv("DAEMON_TARGET_RR", 1.5))
 PRIMARY_MIN_SCORE = int(os.getenv("DAEMON_PRIMARY_MIN_SCORE", 9))   # tradeable bar
-SECONDARY_MIN_SCORE = int(os.getenv("DAEMON_SECONDARY_MIN_SCORE", 10))  # other coins must be 10/10 to alert
+# Non-primary symbols (not in our 6mo validation set) need to clear a higher bar
+# AND have all 3 timeframes structurally aligned. Bumped from 10→11 after MASK
+# (score 12 with mtf_trend "Bearish" → stopped out as expected, but the mixed
+# TF signal made it lower-confidence than the score implied).
+SECONDARY_MIN_SCORE = int(os.getenv("DAEMON_SECONDARY_MIN_SCORE", 11))
+SECONDARY_REQUIRE_TF_ALIGN = os.getenv("DAEMON_SECONDARY_REQUIRE_TF_ALIGN", "true").lower() == "true"
+
+
+def _tf_aligned(r: dict) -> bool:
+    """All 3 TFs structurally agree with the trade direction."""
+    direction = r.get("direction")
+    if not direction:
+        return False
+    target = "Bullish" if direction == "long" else "Bearish"
+    return r.get("htf_trend") == target and r.get("mtf_trend") == target and r.get("ltf_trend") == target
 
 
 def _suggest_levels(client: Client, symbol: str, direction: str, current_price: float) -> Optional[dict]:
@@ -496,8 +512,17 @@ class SetupScannerJob(Job):
             is_primary = sym in PRIMARY_SYMBOLS
             min_for_alert = PRIMARY_MIN_SCORE if is_primary else SECONDARY_MIN_SCORE
             r["primary"] = is_primary
+            r["tf_aligned"] = _tf_aligned(r)
             if r["score"] >= min_for_alert:
-                tradeable.append(r)
+                # Non-primary symbols additionally require all 3 TFs aligned (HTF=MTF=LTF
+                # in trade direction). Catches the MASK case: score 12 with MTF Bearish.
+                if not is_primary and SECONDARY_REQUIRE_TF_ALIGN and not r["tf_aligned"]:
+                    log.info(f"{sym}: score {r['score']} but TFs not aligned "
+                             f"(htf={r.get('htf_trend')} mtf={r.get('mtf_trend')} "
+                             f"ltf={r.get('ltf_trend')}) — demoting to watching")
+                    watching.append(r)
+                else:
+                    tradeable.append(r)
             else:
                 watching.append(r)
 
@@ -527,6 +552,7 @@ class SetupScannerJob(Job):
                     suggested_entry=levels["entry"], suggested_stop=levels["stop"],
                     suggested_target=levels["target"], rr=levels["rr"],
                     primary=r["primary"], reasons=r.get("reasons", []),
+                    tf_aligned=r.get("tf_aligned", False),
                 )
             except Exception as e:
                 log.error(f"setup_alert failed for {sym}: {e}")

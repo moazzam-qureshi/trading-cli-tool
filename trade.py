@@ -997,6 +997,26 @@ def journal_log(symbol, side, entry, quantity, stop, target, setup, score, reaso
     out({"logged": tid, "note_file": f"trade_notes/{tid}.md"})
 
 
+@journal.command(name="recompute-pnl")
+@click.argument("trade_id")
+def journal_recompute_pnl(trade_id):
+    """Recompute net P&L from real fills + update an already-closed trade row."""
+    rows = jrnl.list_trades(10000)
+    row = next((r for r in rows if r["trade_id"] == trade_id), None)
+    if not row:
+        raise click.ClickException(f"Trade {trade_id} not found")
+    client = get_client()
+    info = jrnl.compute_net_pnl(client, row["symbol"], row["timestamp"],
+                                  buy_order_id=row.get("buy_order_id", ""),
+                                  oco_list_id=row.get("oco_list_id", ""))
+    pnl = info["net_pnl_usdt"]
+    cost = info["buy_quote_usdt"]
+    pnl_pct = pnl / cost * 100 if cost else 0
+    jrnl.close_trade(trade_id, row["outcome"], float(row.get("exit_price") or 0),
+                     round(pnl, 4), round(pnl_pct, 2), row.get("lesson", ""))
+    out({"trade_id": trade_id, **info, "pnl_pct": round(pnl_pct, 2)})
+
+
 @journal.command(name="close")
 @click.argument("trade_id")
 @click.option("--outcome", type=click.Choice(["WIN", "LOSS", "BE"]), required=True)
@@ -1019,7 +1039,9 @@ def journal_close(trade_id, outcome, exit_price, lesson, gross):
     else:
         client = get_client()
         try:
-            fee_info = jrnl.compute_net_pnl(client, row["symbol"], row["timestamp"])
+            fee_info = jrnl.compute_net_pnl(client, row["symbol"], row["timestamp"],
+                                             buy_order_id=row.get("buy_order_id", ""),
+                                             oco_list_id=row.get("oco_list_id", ""))
             pnl = fee_info["net_pnl_usdt"]
             cost_basis = fee_info["buy_quote_usdt"] or (float(row["entry_price"]) * float(row["quantity"]))
             pnl_pct = pnl / cost_basis * 100 if cost_basis else 0

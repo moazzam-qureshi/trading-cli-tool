@@ -119,35 +119,63 @@ def close_trade(trade_id: str, outcome: str, exit_price: float, pnl_usdt: float,
         note.write_text(text, encoding="utf-8")
 
 
-def compute_net_pnl(client, symbol: str, entry_ts_iso: str, exit_ts_iso: str | None = None) -> dict:
-    """Compute net P&L by walking get_my_trades fills between entry and exit timestamps.
+def compute_net_pnl(client, symbol: str, entry_ts_iso: str, exit_ts_iso: str | None = None,
+                    buy_order_id: str = "", oco_list_id: str = "") -> dict:
+    """Compute net P&L by walking get_my_trades fills.
 
     Net = sum(sell quoteQty) - sum(buy quoteQty) - sum(commission in USDT-equivalent).
-    Fees in the base asset are valued at the trade's price.
-    Fees in BNB or other are best-effort (priced at current ticker).
-    """
-    entry_ms = int(datetime.fromisoformat(entry_ts_iso.replace("Z", "+00:00")).timestamp() * 1000)
-    exit_ms = (int(datetime.fromisoformat(exit_ts_iso.replace("Z", "+00:00")).timestamp() * 1000)
-               if exit_ts_iso else None)
 
-    fills = client.get_my_trades(symbol=symbol, limit=200)
+    Strategy:
+      1. If buy_order_id is provided, use it to anchor the buy fill exactly.
+      2. Otherwise, find the LAST buy fill ≤ exit_ts (or now) and pair it with all
+         sell fills ≥ that buy. This is robust to journal entries logged after the
+         buy (the old ±5s grace was way too tight for manual logs).
+    """
+    fills = client.get_my_trades(symbol=symbol, limit=500)
+    fills.sort(key=lambda f: int(f["time"]))
     base = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
     quote = "USDT" if symbol.endswith("USDT") else "BUSD" if symbol.endswith("BUSD") else "USDC"
 
-    relevant = []
+    exit_ms = (int(datetime.fromisoformat(exit_ts_iso.replace("Z", "+00:00")).timestamp() * 1000)
+               if exit_ts_iso else None)
+
+    # Find the buy: explicit order_id wins; else use most recent buy before exit (or any).
+    if buy_order_id:
+        buy_fills = [f for f in fills if str(f.get("orderId")) == str(buy_order_id)]
+    else:
+        candidate_buys = [f for f in fills if f["isBuyer"]]
+        if exit_ms:
+            candidate_buys = [f for f in candidate_buys if int(f["time"]) <= exit_ms + 5000]
+        # Group by orderId, take the most recent group
+        if candidate_buys:
+            last_order_id = candidate_buys[-1]["orderId"]
+            buy_fills = [f for f in candidate_buys if f["orderId"] == last_order_id]
+        else:
+            buy_fills = []
+
+    if not buy_fills:
+        return {"buy_quote_usdt": 0, "sell_quote_usdt": 0, "gross_pnl_usdt": 0,
+                "fees_usdt": 0, "net_pnl_usdt": 0, "buy_fills": 0, "sell_fills": 0,
+                "error": "no buy fills found"}
+
+    buy_start_ms = min(int(f["time"]) for f in buy_fills)
+    # Sells: those after the buy AND matching the OCO list id when provided
+    sell_fills = []
     for f in fills:
-        t = int(f["time"])
-        if t < entry_ms - 5000:  # 5s grace
+        if f["isBuyer"]:
             continue
-        if exit_ms and t > exit_ms + 5000:
+        if int(f["time"]) < buy_start_ms - 1000:
             continue
-        relevant.append(f)
+        if oco_list_id and str(f.get("orderListId")) not in (str(oco_list_id), "-1"):
+            continue
+        if exit_ms and int(f["time"]) > exit_ms + 60_000:
+            continue
+        sell_fills.append(f)
 
-    buys = [f for f in relevant if f["isBuyer"]]
-    sells = [f for f in relevant if not f["isBuyer"]]
+    relevant = buy_fills + sell_fills
 
-    buy_quote = sum(float(f["quoteQty"]) for f in buys)
-    sell_quote = sum(float(f["quoteQty"]) for f in sells)
+    buy_quote = sum(float(f["quoteQty"]) for f in buy_fills)
+    sell_quote = sum(float(f["quoteQty"]) for f in sell_fills)
 
     fee_usdt = 0.0
     for f in relevant:
@@ -175,8 +203,8 @@ def compute_net_pnl(client, symbol: str, entry_ts_iso: str, exit_ts_iso: str | N
         "gross_pnl_usdt": round(gross, 4),
         "fees_usdt": round(fee_usdt, 4),
         "net_pnl_usdt": round(net, 4),
-        "buy_fills": len(buys),
-        "sell_fills": len(sells),
+        "buy_fills": len(buy_fills),
+        "sell_fills": len(sell_fills),
     }
 
 
