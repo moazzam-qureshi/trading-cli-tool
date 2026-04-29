@@ -621,13 +621,15 @@ def setup_scan(quote, top, min_score, json_out):
 @click.option("--equity", default=150.0, help="Starting equity for compounding sim")
 @click.option("--partial-pct", default=0.0, help="%% of position to close at partial_at_r (0=disabled)")
 @click.option("--partial-at-r", default=1.0)
+@click.option("--fast/--slow", default=True, help="Use vectorized engine (default: fast)")
 @click.option("--show-trades", is_flag=True, help="Print every simulated trade")
 @click.option("--json", "json_out", is_flag=True)
-def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, partial_pct, partial_at_r, show_trades, json_out):
+def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, partial_pct, partial_at_r, fast, show_trades, json_out):
     """Backtest the confluence strategy on historical data."""
     import backtest as bt
     client = get_client()
-    result = bt.run_backtest(
+    runner = bt.run_backtest_fast if fast else bt.run_backtest
+    result = runner(
         client, symbol.upper(),
         bars_15m=bars, min_score=min_score, rr=rr,
         max_hold_bars=max_hold, risk_pct=risk_pct, starting_equity=equity,
@@ -710,17 +712,19 @@ def backtest_multi(symbols, bars, min_score, rr, partial_pct, partial_at_r, json
 @click.option("--partial-pct", default=0.0)
 @click.option("--partial-at-r", default=1.0)
 @click.option("--score-every-n", default=4, help="Score every Nth 15m bar (4 = hourly, default for speed)")
+@click.option("--fast/--slow", default=True, help="Use vectorized engine (default: fast)")
 @click.option("--json", "json_out", is_flag=True)
-def backtest_sweep(symbols, bars, scores, rr, partial_pct, partial_at_r, score_every_n, json_out):
+def backtest_sweep(symbols, bars, scores, rr, partial_pct, partial_at_r, score_every_n, fast, json_out):
     """Sweep min_score thresholds to find where edge appears."""
     import backtest as bt
     client = get_client()
     syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     score_list = [int(s) for s in scores.split(",")]
-    result = bt.run_score_sweep(client, syms, score_list,
-                                 bars_15m=bars, rr=rr,
-                                 partial_pct=partial_pct, partial_at_r=partial_at_r,
-                                 score_every_n=score_every_n)
+    runner = bt.run_score_sweep_fast if fast else bt.run_score_sweep
+    result = runner(client, syms, score_list,
+                    bars_15m=bars, rr=rr,
+                    partial_pct=partial_pct, partial_at_r=partial_at_r,
+                    score_every_n=score_every_n)
     if json_out:
         out(result)
         return

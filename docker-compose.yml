@@ -19,9 +19,10 @@ services:
     # Optional: run a quick CLI command instead of the daemon
     # docker compose run --rm trade-cli python trade.py status
 
-    # Resource limits — daemon is light, this prevents runaway loops
-    mem_limit: 512m
-    cpus: 0.5
+    # Resource limits — daemon is idle most of the time, but backtests can be CPU-heavy.
+    # Box has 12 cores / 62 GB RAM; we leave headroom for the rest of the stack.
+    mem_limit: 4g
+    cpus: 8
 
     # Stop signal handling — tini in the image already handles this
     stop_grace_period: 15s

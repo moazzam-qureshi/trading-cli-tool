@@ -1,7 +1,8 @@
 """SMC + indicator analysis engine for trade-cli."""
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+import bisect
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 import numpy as np
@@ -622,4 +623,206 @@ def confluence_score(client: Client, symbol: str) -> dict:
         "mtf_trend": mtf["structure"]["trend"],
         "ltf_trend": ltf["structure"]["trend"],
         "current_price": ltf["current_price"],
+    }
+
+
+# ──────────────────────────────────────────────────────────────────
+# Vectorized precompute + score_at — for FAST backtests.
+# Old confluence_score / score_from_dfs untouched (used live + by current sweeps).
+# ──────────────────────────────────────────────────────────────────
+
+SWING_LOOKBACK = 3
+
+
+@dataclass
+class Precomputed:
+    df: pd.DataFrame
+    interval: str
+    rsi_arr: np.ndarray
+    atr_arr: np.ndarray
+    vol_ratio_arr: np.ndarray
+    swings: list  # list[Swing]
+    swing_confirm_idx: list  # parallel: bar index at which swing[k] becomes detectable
+    obs_bull: list[dict]
+    obs_bear: list[dict]
+    obs_bull_confirm: list[int]
+    obs_bear_confirm: list[int]
+    fvgs_bull: list[dict]
+    fvgs_bear: list[dict]
+    fvgs_bull_confirm: list[int]
+    fvgs_bear_confirm: list[int]
+
+
+def _detect_obs_full(df: pd.DataFrame, move_threshold: float = 1.5) -> tuple[list, list]:
+    """Full-series order-block detection. Returns (bullish, bearish) lists with confirm_idx."""
+    a = atr(df, 14).values
+    closes = df["close"].values
+    opens = df["open"].values
+    highs = df["high"].values
+    lows = df["low"].values
+    n = len(df)
+    bull, bear = [], []
+    for i in range(2, n - 4):
+        atr_here = a[i]
+        if not np.isfinite(atr_here) or atr_here == 0:
+            continue
+        run_up = closes[i + 1:i + 4].max() - opens[i + 1]
+        run_dn = opens[i + 1] - closes[i + 1:i + 4].min()
+        body = closes[i] - opens[i]
+        if body < 0 and run_up >= move_threshold * atr_here:
+            bull.append({"confirm_idx": i + 3, "idx": i,
+                         "low": float(lows[i]), "high": float(highs[i])})
+        if body > 0 and run_dn >= move_threshold * atr_here:
+            bear.append({"confirm_idx": i + 3, "idx": i,
+                         "low": float(lows[i]), "high": float(highs[i])})
+    return bull, bear
+
+
+def _detect_fvgs_full(df: pd.DataFrame) -> tuple[list, list]:
+    highs = df["high"].values
+    lows = df["low"].values
+    n = len(df)
+    bull, bear = [], []
+    for i in range(n - 2):
+        if highs[i] < lows[i + 2]:
+            bull.append({"confirm_idx": i + 2, "idx": i,
+                         "low": float(highs[i]), "high": float(lows[i + 2])})
+        if lows[i] > highs[i + 2]:
+            bear.append({"confirm_idx": i + 2, "idx": i,
+                         "low": float(highs[i + 2]), "high": float(lows[i])})
+    return bull, bear
+
+
+def precompute(df: pd.DataFrame, interval: str) -> Precomputed:
+    """Run all vectorizable analysis once on the full series."""
+    rsi_arr = rsi(df["close"]).values
+    atr_arr = atr(df).values
+    vol_avg = df["volume"].rolling(20).mean().values
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vol_ratio_arr = df["volume"].values / np.where(vol_avg > 0, vol_avg, np.nan)
+
+    swings = detect_swings(df, lookback=SWING_LOOKBACK)
+    swing_confirm = [s.index + SWING_LOOKBACK for s in swings]
+
+    obs_bull, obs_bear = _detect_obs_full(df)
+    fvgs_bull, fvgs_bear = _detect_fvgs_full(df)
+
+    return Precomputed(
+        df=df, interval=interval,
+        rsi_arr=rsi_arr, atr_arr=atr_arr, vol_ratio_arr=vol_ratio_arr,
+        swings=swings, swing_confirm_idx=swing_confirm,
+        obs_bull=obs_bull, obs_bear=obs_bear,
+        obs_bull_confirm=[o["confirm_idx"] for o in obs_bull],
+        obs_bear_confirm=[o["confirm_idx"] for o in obs_bear],
+        fvgs_bull=fvgs_bull, fvgs_bear=fvgs_bear,
+        fvgs_bull_confirm=[f["confirm_idx"] for f in fvgs_bull],
+        fvgs_bear_confirm=[f["confirm_idx"] for f in fvgs_bear],
+    )
+
+
+def _swings_up_to(pre: Precomputed, i: int) -> list:
+    """O(log n) slice of swings detectable by bar i."""
+    cut = bisect.bisect_right(pre.swing_confirm_idx, i)
+    return pre.swings[:cut]
+
+
+def _detect_sweep_fast(closes: np.ndarray, highs: np.ndarray, lows: np.ndarray,
+                       i: int, swings: list, bars: int = 10) -> Optional[dict]:
+    """Sweep detection using arrays + already-filtered swings."""
+    if len(swings) < 2 or i < bars - 1:
+        return None
+    start = i - bars + 1
+    last_close = float(closes[i])
+    win_high = float(highs[start:i + 1].max())
+    win_low = float(lows[start:i + 1].min())
+    for s in reversed(swings[-6:]):
+        if s.kind in ("HH", "LH", "H"):
+            if win_high > s.price and last_close < s.price:
+                return {"type": "bearish_sweep", "level": s.price}
+        elif s.kind in ("HL", "LL", "L"):
+            if win_low < s.price and last_close > s.price:
+                return {"type": "bullish_sweep", "level": s.price}
+    return None
+
+
+def score_at(htf_pre: Precomputed, mtf_pre: Precomputed, ltf_pre: Precomputed,
+             htf_i: int, mtf_i: int, ltf_i: int) -> dict:
+    """Fast equivalent of score_from_dfs — uses precomputed arrays + bisect lookups."""
+    # HTF trend
+    htf_swings_now = _swings_up_to(htf_pre, htf_i)
+    htf_close = float(htf_pre.df["close"].values[htf_i])
+    htf_struct = structure_summary(htf_swings_now, htf_close)
+    htf_trend = htf_struct["trend"]
+
+    direction = "long" if htf_trend == "Bullish" else "short" if htf_trend == "Bearish" else None
+    score = 3 if direction else 0
+    ltf_close = float(ltf_pre.df["close"].values[ltf_i])
+
+    if not direction:
+        return {"direction": None, "score": 0, "reasons": [],
+                "current_price": ltf_close, "ltf_atr": float(ltf_pre.atr_arr[ltf_i]),
+                "ltf_swings": []}
+
+    # MTF sweep
+    mtf_swings_now = _swings_up_to(mtf_pre, mtf_i)
+    sweep = _detect_sweep_fast(
+        mtf_pre.df["close"].values, mtf_pre.df["high"].values, mtf_pre.df["low"].values,
+        mtf_i, mtf_swings_now,
+    )
+    if sweep:
+        want = "bullish_sweep" if direction == "long" else "bearish_sweep"
+        if sweep["type"] == want:
+            score += 3
+
+    mtf_close = float(mtf_pre.df["close"].values[mtf_i])
+
+    # OBs — match slow path: scan only the last 50 MTF bars (lookback window)
+    OB_FVG_LOOKBACK = 50
+    min_idx_ob = mtf_i - OB_FVG_LOOKBACK
+    obs_bucket = mtf_pre.obs_bull if direction == "long" else mtf_pre.obs_bear
+    obs_confirm = mtf_pre.obs_bull_confirm if direction == "long" else mtf_pre.obs_bear_confirm
+    cut = bisect.bisect_right(obs_confirm, mtf_i)
+    recent_obs = [ob for ob in obs_bucket[:cut] if ob["idx"] >= min_idx_ob][-3:]
+    for ob in recent_obs:
+        if ob["low"] <= mtf_close <= ob["high"]:
+            score += 2
+            break
+
+    # FVGs — same lookback constraint
+    fvgs_bucket = mtf_pre.fvgs_bull if direction == "long" else mtf_pre.fvgs_bear
+    fvgs_confirm = mtf_pre.fvgs_bull_confirm if direction == "long" else mtf_pre.fvgs_bear_confirm
+    cut = bisect.bisect_right(fvgs_confirm, mtf_i)
+    recent_fvgs = [fvg for fvg in fvgs_bucket[:cut] if fvg["idx"] >= min_idx_ob][-3:]
+    for fvg in recent_fvgs:
+        if fvg["low"] <= mtf_close <= fvg["high"]:
+            score += 2
+            break
+
+    # LTF structure
+    ltf_swings_now = _swings_up_to(ltf_pre, ltf_i)
+    ltf_struct = structure_summary(ltf_swings_now, ltf_close)
+    ltf_trend = ltf_struct["trend"]
+    if (direction == "long" and ltf_trend == "Bullish") or (direction == "short" and ltf_trend == "Bearish"):
+        score += 2
+
+    # Volume
+    vol = ltf_pre.vol_ratio_arr[ltf_i]
+    if np.isfinite(vol) and vol > 1.5:
+        score += 1
+
+    # RSI
+    rsi_v = ltf_pre.rsi_arr[ltf_i]
+    if np.isfinite(rsi_v):
+        if direction == "long" and 30 < rsi_v < 60:
+            score += 1
+        elif direction == "short" and 40 < rsi_v < 70:
+            score += 1
+
+    return {
+        "direction": direction,
+        "score": score,
+        "reasons": [],
+        "current_price": ltf_close,
+        "ltf_atr": float(ltf_pre.atr_arr[ltf_i]),
+        "ltf_swings": ltf_swings_now,
     }
