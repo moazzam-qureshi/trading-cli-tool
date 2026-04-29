@@ -200,6 +200,40 @@ def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker,
     target_d = round_step(Decimal(str(target)), tick)
     stop_limit_d = round_step(stop_d * (Decimal("1") - Decimal(str(slip)) / Decimal("100")), tick)
 
+    # ── Sanity guards: catch order-of-magnitude typos BEFORE sending any order ──
+    # Spot longs only: stop must be below current price, target above. Anything > 50%
+    # off current price is almost certainly a copy-paste error (e.g. another symbol's
+    # levels). Real framework stops/targets are within a few percent of price.
+    cur_f = float(current)
+    if float(stop_d) >= cur_f:
+        raise click.ClickException(
+            f"Refusing buy: stop {stop_d} is at/above current {current}. "
+            f"For a long, stop must be below current price."
+        )
+    if float(target_d) <= cur_f:
+        raise click.ClickException(
+            f"Refusing buy: target {target_d} is at/below current {current}. "
+            f"For a long, target must be above current price."
+        )
+    stop_dist_pct = (cur_f - float(stop_d)) / cur_f * 100
+    target_dist_pct = (float(target_d) - cur_f) / cur_f * 100
+    if stop_dist_pct > 50:
+        raise click.ClickException(
+            f"Refusing buy: stop {stop_d} is {stop_dist_pct:.1f}% below current {current}. "
+            f"Almost certainly a typo (right symbol's stop pasted on wrong symbol?). "
+            f"Re-check before retrying."
+        )
+    if target_dist_pct > 50:
+        raise click.ClickException(
+            f"Refusing buy: target {target_d} is {target_dist_pct:.1f}% above current {current}. "
+            f"Almost certainly a typo. Re-check before retrying."
+        )
+    if stop_dist_pct < 0.05:
+        raise click.ClickException(
+            f"Refusing buy: stop {stop_d} is only {stop_dist_pct:.3f}% below current — "
+            f"will be triggered by noise. Use a wider stop based on real structure."
+        )
+
     plan = {
         "symbol": symbol,
         "side": "BUY",
@@ -412,6 +446,20 @@ def protect(symbol, stop, target, quantity, slip):
     stop_d = round_step(Decimal(str(stop)), tick)
     target_d = round_step(Decimal(str(target)), tick)
     stop_limit_d = round_step(stop_d * (Decimal("1") - Decimal(str(slip)) / Decimal("100")), tick)
+
+    # Same sanity guards as buy: catch order-of-magnitude typos
+    current = float(client.get_symbol_ticker(symbol=symbol)["price"])
+    if float(stop_d) >= current:
+        raise click.ClickException(f"Refusing protect: stop {stop_d} ≥ current {current}.")
+    if float(target_d) <= current:
+        raise click.ClickException(f"Refusing protect: target {target_d} ≤ current {current}.")
+    sd = (current - float(stop_d)) / current * 100
+    td = (float(target_d) - current) / current * 100
+    if sd > 50 or td > 50:
+        raise click.ClickException(
+            f"Refusing protect: stop {sd:.1f}% / target {td:.1f}% from current {current}. "
+            f"Almost certainly a typo — re-check before retrying."
+        )
 
     oco = place_oco_sell(
         client,
