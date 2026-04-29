@@ -234,3 +234,9 @@ def heartbeat(symbol: str, price: float, entry: float, stop: float, target: floa
         ],
     )
     send("signals", embed=embed)
+
+
+def whale_event(symbol: str, headline: str, fields: list[dict], color: str = "purple") -> bool:
+    """Post a whale-flow event (large trade, CVD divergence, funding flip, OI spike) to the WHALE channel."""
+    embed = _embed(title=f"🐋 {headline} — {symbol}", color=color, fields=fields)
+    return send("whale", embed=embed, fallback_to="signals")

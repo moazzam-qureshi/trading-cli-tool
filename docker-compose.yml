@@ -8,6 +8,10 @@ services:
     # API keys + webhooks (never baked into image)
     env_file:
       - .env
+    # Agent operation mode — LIVE. Agent will place real orders when the 3-layer
+    # filter and gates all pass. Set "true" to revert to log-only.
+    environment:
+      AGENT_DRY_RUN: "false"
 
     # Persist mutable state across restarts/rebuilds
     volumes:
@@ -15,6 +19,8 @@ services:
       - ./trade_notes:/app/trade_notes
       - ./trades.csv:/app/trades.csv
       - ./state.json:/app/state.json
+      - ./charts:/app/charts
+      - claude-config:/home/trader/.claude
 
     # Optional: run a quick CLI command instead of the daemon
     # docker compose run --rm trade-cli python trade.py status
@@ -34,3 +40,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+# Named volume for claude-code login token — survives `docker compose up -d --build`
+volumes:
+  claude-config:

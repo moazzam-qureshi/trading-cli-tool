@@ -18,10 +18,12 @@ from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
 import analysis
+import charting
 import journal as jrnl
 import display
 import notify
 import risk
+import whale_flow
 
 load_dotenv()
 
@@ -610,14 +612,202 @@ def _short_tf(client, symbol, tf):
 @cli.command()
 @click.argument("symbol")
 @click.option("--json", "json_out", is_flag=True)
-def confluence(symbol, json_out):
+@click.option("--whale", is_flag=True, help="Include whale-flow bonus stars (funding, OI, CVD, large trades)")
+def confluence(symbol, json_out, whale):
     """Score the A+ setup confluence across HTF/MTF/LTF."""
     client = get_client()
     data = analysis.confluence_score(client, symbol.upper())
+
+    if whale and data.get("direction"):
+        flow = whale_flow.whale_flow_summary(client, symbol.upper())
+        bonus, bonus_reasons = whale_flow.whale_bonus_stars(flow, data["direction"])
+        data["whale_flow"] = flow
+        data["whale_bonus_stars"] = bonus
+        data["score"] = data["score"] + bonus
+        data["reasons"] = data["reasons"] + bonus_reasons
+        # Re-evaluate verdict with bonus
+        s = data["score"]
+        data["verdict"] = "A+ SETUP" if s >= 8 else "Decent" if s >= 5 else "Skip"
+
     if json_out:
         out(data)
     else:
         display.render_confluence(data)
+
+
+@cli.command()
+@click.argument("symbol")
+@click.option("--tf", default="15m", help="Timeframe: 5m, 15m, 1h, 4h, 1d (default 15m)")
+@click.option("--bars", default=150, help="Number of candles to render (default 150)")
+@click.option("--out", default=None, help="Output path (default /app/charts/<SYM>_<TF>.png)")
+def chart(symbol, tf, bars, out):
+    """Render a candlestick chart with SMC overlays (OBs, FVGs, swings, sweep)."""
+    client = get_client()
+    path = charting.render_chart(client, symbol.upper(), tf=tf, bars=bars, out_path=out)
+    click.echo(json.dumps({"symbol": symbol.upper(), "tf": tf, "bars": bars, "path": path}))
+
+
+@cli.command(name="chart-multi")
+@click.argument("symbol")
+@click.option("--tfs", default="1d,4h,1h,15m,5m", help="Comma-separated timeframes (pro-trader standard: 1d,4h,1h,15m,5m)")
+def chart_multi(symbol, tfs):
+    """Render charts at multiple pro-trader timeframes for a full top-down read."""
+    client = get_client()
+    tf_list = [t.strip() for t in tfs.split(",") if t.strip()]
+    bars_for = {"1d": 120, "4h": 150, "1h": 150, "15m": 150, "5m": 100, "30m": 150, "2h": 150}
+    paths = {}
+    errors = {}
+    for tf in tf_list:
+        try:
+            paths[tf] = charting.render_chart(
+                client, symbol.upper(), tf=tf, bars=bars_for.get(tf, 150)
+            )
+        except Exception as e:
+            errors[tf] = str(e)
+    click.echo(json.dumps({"symbol": symbol.upper(), "rendered": paths, "errors": errors}))
+
+
+def _whale_event_fields(flow: dict) -> tuple[list[dict], list[str]]:
+    """Build Discord embed fields + summary triggers from a whale-flow snapshot."""
+    fields = []
+    triggers = []
+
+    f = flow.get("funding")
+    if f is not None:
+        fields.append({"name": "Funding", "value": f"{f['current_pct']:+.4f}% ({f['interpretation']})", "inline": True})
+        if f["interpretation"].startswith("deeply"):
+            triggers.append(f"funding_{f['interpretation']}")
+
+    oi = flow.get("open_interest")
+    if oi is not None and oi.get("delta_24h_pct") is not None:
+        fields.append({"name": "OI 24h Δ", "value": f"{oi['delta_24h_pct']:+.2f}% ({oi['interpretation']})", "inline": True})
+        if "strongly" in oi["interpretation"]:
+            triggers.append(f"oi_{oi['interpretation']}")
+
+    cvd = flow.get("spot_cvd_4h") or flow.get("spot_cvd")
+    if cvd:
+        fields.append({"name": "Spot CVD 4h", "value": f"{cvd['cvd_pct_of_total']:+.2f}% ({cvd['interpretation']})", "inline": True})
+        if "strong" in cvd["interpretation"]:
+            triggers.append(f"cvd_{cvd['interpretation']}")
+
+    lt = flow.get("large_trades_1h") or flow.get("large_trades")
+    if lt and lt["total_large_trades"] > 0:
+        fields.append({"name": "Large trades 1h", "value": f"{lt['total_large_trades']} trades, net ${lt['net_notional_usdt']:+,.0f}", "inline": False})
+        if abs(lt["net_notional_usdt"]) > 250_000:
+            triggers.append(f"large_net_{'buy' if lt['net_notional_usdt']>0 else 'sell'}")
+
+    return fields, triggers
+
+
+@cli.command(name="whale-alert")
+@click.argument("symbol")
+@click.option("--force", is_flag=True, help="Send even if no notable trigger")
+def whale_alert_cmd(symbol, force):
+    """Run whale-flow on a symbol; post snapshot to #whale channel if notable."""
+    client = get_client()
+    sym = symbol.upper()
+    flow = whale_flow.whale_flow_summary(client, sym)
+    fields, triggers = _whale_event_fields(flow)
+
+    if not triggers and not force:
+        click.echo(json.dumps({"symbol": sym, "triggers": [], "sent": False, "reason": "no_notable_event"}))
+        return
+
+    headline = ", ".join(triggers) if triggers else "snapshot"
+    color = "green" if any("buy" in t or "accumulation" in t for t in triggers) else \
+            "red" if any("sell" in t or "distribution" in t for t in triggers) else "purple"
+    sent = notify.whale_event(sym, headline, fields, color=color)
+    click.echo(json.dumps({"symbol": sym, "triggers": triggers, "sent": sent}))
+
+
+@cli.command(name="whale-watch")
+@click.option("--symbols", default="", help="Comma-separated symbols (default: top 20 by USDT volume)")
+@click.option("--top", default=20, help="If --symbols not given, scan this many top-volume USDT pairs")
+def whale_watch(symbols, top):
+    """Scan symbols for whale-flow triggers; post notable ones to #whale."""
+    client = get_client()
+
+    if symbols:
+        sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        tickers = client.get_ticker()
+        usdts = [t for t in tickers if t["symbol"].endswith("USDT")]
+        usdts.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
+        sym_list = [t["symbol"] for t in usdts[:top]]
+
+    results = []
+    for sym in sym_list:
+        try:
+            flow = whale_flow.whale_flow_summary(client, sym)
+            fields, triggers = _whale_event_fields(flow)
+            if triggers:
+                color = "green" if any("buy" in t or "accumulation" in t for t in triggers) else \
+                        "red" if any("sell" in t or "distribution" in t for t in triggers) else "purple"
+                notify.whale_event(sym, ", ".join(triggers), fields, color=color)
+                results.append({"symbol": sym, "triggers": triggers, "sent": True})
+            else:
+                results.append({"symbol": sym, "triggers": [], "sent": False})
+        except Exception as e:
+            results.append({"symbol": sym, "error": str(e)})
+
+    out({"scanned": len(sym_list), "alerts_sent": sum(1 for r in results if r.get("sent")), "results": results})
+
+
+@cli.command(name="whale-flow")
+@click.argument("symbol")
+@click.option("--cvd-minutes", default=240, help="CVD lookback window in minutes (default 240 = 4h)")
+@click.option("--large-threshold", default=50000.0, help="Large-trade threshold in USDT (default 50k)")
+@click.option("--large-minutes", default=60, help="Large-trade lookback window (default 60min)")
+@click.option("--json", "json_out", is_flag=True)
+def whale_flow_cmd(symbol, cvd_minutes, large_threshold, large_minutes, json_out):
+    """Pull funding, OI, spot CVD, and large-trade activity for a symbol."""
+    client = get_client()
+    sym = symbol.upper()
+    data = {
+        "symbol": sym,
+        "funding": whale_flow.get_funding(client, sym),
+        "open_interest": whale_flow.get_open_interest(client, sym),
+        "spot_cvd": whale_flow.get_spot_cvd(client, sym, lookback_minutes=cvd_minutes),
+        "large_trades": whale_flow.get_large_trades(
+            client, sym, threshold_usdt=large_threshold, lookback_minutes=large_minutes
+        ),
+    }
+    if json_out:
+        out(data)
+        return
+
+    # Pretty render
+    click.echo(f"\n=== Whale-flow: {sym} ===\n")
+
+    f = data["funding"]
+    if f:
+        click.echo(f"Funding:        {f['current_pct']:+.4f}%   (24h avg {f['avg_24h_pct']:+.4f}%)")
+        click.echo(f"                → {f['interpretation']}")
+    else:
+        click.echo("Funding:        no perp listing")
+
+    oi = data["open_interest"]
+    if oi:
+        d = oi.get("delta_24h_pct")
+        click.echo(f"Open Interest:  {oi['current']:.2f}   24h Δ {d:+.2f}%   → {oi['interpretation']}")
+    else:
+        click.echo("Open Interest:  no perp listing")
+
+    cvd = data["spot_cvd"]
+    click.echo(f"\nSpot CVD ({cvd['lookback_minutes']}min, {cvd['trade_count']} trades):")
+    click.echo(f"  Buy vol:   ${cvd['buy_vol_usdt']:>14,.0f}")
+    click.echo(f"  Sell vol:  ${cvd['sell_vol_usdt']:>14,.0f}")
+    click.echo(f"  CVD:       ${cvd['cvd_usdt']:>+14,.0f}   ({cvd['cvd_pct_of_total']:+.2f}%)")
+    click.echo(f"  → {cvd['interpretation']}")
+
+    lt = data["large_trades"]
+    click.echo(f"\nLarge trades ≥${lt['threshold_usdt']:,.0f}, last {lt['lookback_minutes']}min:")
+    click.echo(f"  Total:     {lt['total_large_trades']}   (buys {lt['buy_count']} / sells {lt['sell_count']})")
+    click.echo(f"  Net:       ${lt['net_notional_usdt']:>+14,.0f}")
+    if lt['samples']:
+        click.echo("  Recent:")
+        for s in lt['samples'][-5:]:
+            click.echo(f"    {s['time'][11:19]}  {s['side']:>4}  ${s['notional_usdt']:>10,.0f}  @ {s['price']}")
 
 
 @cli.command(name="setup-scan")

@@ -34,6 +34,8 @@ from dotenv import load_dotenv
 
 import analysis
 import notify
+import whale_flow
+import claude_agent
 from binance.client import Client
 
 load_dotenv()
@@ -150,7 +152,7 @@ class PositionMonitorJob(Job):
         active_symbols = set(by_symbol.keys())
         tracked = set(positions_state.keys())
         for closed_sym in tracked - active_symbols:
-            self._handle_close(client, closed_sym, positions_state[closed_sym])
+            self._handle_close(client, closed_sym, positions_state[closed_sym], state)
             positions_state.pop(closed_sym, None)
 
         # 2) For each active OCO-protected position
@@ -212,6 +214,15 @@ class PositionMonitorJob(Job):
                 if ps["last_structure"] and cur != ps["last_structure"]:
                     notify.structure_change(sym, ps["last_structure"], cur, "1h")
                     log.info(f"{sym} structure {ps['last_structure']} -> {cur}")
+                    # Adverse flip on an open long → ask agent to evaluate early-exit
+                    if cur == "Bearish":
+                        claude_agent.enqueue_event(state, {
+                            "symbol": sym,
+                            "trigger": f"adverse_structure_{ps['last_structure']}_to_{cur}",
+                            "type": "position_review",
+                            "current_price": price,
+                            "direction": "long",
+                        })
                 ps["last_structure"] = cur
             except Exception as e:
                 log.warning(f"{sym} structure check failed: {e}")
@@ -226,7 +237,7 @@ class PositionMonitorJob(Job):
 
         save_state(state)
 
-    def _handle_close(self, client: Client, sym: str, ps: dict) -> None:
+    def _handle_close(self, client: Client, sym: str, ps: dict, state: dict) -> None:
         """A position previously tracked has no more open orders — find out how it closed and journal it."""
         try:
             fills = client.get_my_trades(symbol=sym, limit=10)
@@ -284,6 +295,11 @@ class PositionMonitorJob(Job):
                     lesson="Auto-closed. Review in trade_notes/ and edit to capture what you learned.",
                 )
             log.info(f"{sym} closed @ {exit_p} → {outcome} (P&L ${pnl:+.2f})")
+            # Feed the agent's daily breaker
+            try:
+                claude_agent.record_trade_closed(state, sym, outcome, float(pnl))
+            except Exception as e:
+                log.warning(f"agent record_trade_closed failed for {sym}: {e}")
         except Exception as e:
             log.error(f"Close detection for {sym} failed: {e}")
 
@@ -557,6 +573,16 @@ class SetupScannerJob(Job):
             except Exception as e:
                 log.error(f"setup_alert failed for {sym}: {e}")
 
+            # Hand fresh tradeable setups to the autonomous agent for 3-layer evaluation
+            if r["direction"] == "long":  # spot-only — agent rejects non-longs anyway, but skip the noise
+                claude_agent.enqueue_event(state, {
+                    "symbol": sym,
+                    "trigger": f"setup_scan_score_{r['score']}",
+                    "type": "setup",
+                    "current_price": r["current_price"],
+                    "direction": r["direction"],
+                })
+
         # Compact roll-up of "watching" list if non-empty (informational)
         if watching:
             watching.sort(key=lambda r: r["score"], reverse=True)
@@ -616,6 +642,113 @@ class DailyReportJob(Job):
 # StartupJob — sends one "daemon online" message
 # ──────────────────────────────────────────────────────────────────
 
+class WhaleWatchJob(Job):
+    """Scans top USDT pairs periodically; alerts on whale-flow triggers via #whale channel.
+
+    Dedupes: a given (symbol, trigger) pair will not re-alert within DEDUPE_MINUTES.
+    """
+    name = "whale_watch"
+
+    DEDUPE_MINUTES = 60
+    THRESHOLDS = {
+        "funding_deeply": True,           # funding interp starts with 'deeply_'
+        "oi_strongly": True,               # oi interp contains 'strongly'
+        "cvd_strong": True,                # cvd interp starts with 'strong_'
+        "large_net_usdt": 250_000,
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.interval = int(os.getenv("DAEMON_WHALE_INTERVAL", 1800))  # 30min default
+        self.top_n = int(os.getenv("DAEMON_WHALE_TOP_N", 20))
+
+    def _trigger_fields(self, flow: dict) -> tuple[list[dict], list[str]]:
+        fields, triggers = [], []
+
+        f = flow.get("funding")
+        if f is not None:
+            fields.append({"name": "Funding", "value": f"{f['current_pct']:+.4f}% ({f['interpretation']})", "inline": True})
+            if f["interpretation"].startswith("deeply"):
+                triggers.append(f"funding_{f['interpretation']}")
+
+        oi = flow.get("open_interest")
+        if oi is not None and oi.get("delta_24h_pct") is not None:
+            fields.append({"name": "OI 24h Δ", "value": f"{oi['delta_24h_pct']:+.2f}% ({oi['interpretation']})", "inline": True})
+            if "strongly" in oi["interpretation"]:
+                triggers.append(f"oi_{oi['interpretation']}")
+
+        cvd = flow.get("spot_cvd_4h")
+        if cvd:
+            fields.append({"name": "Spot CVD 4h", "value": f"{cvd['cvd_pct_of_total']:+.2f}% ({cvd['interpretation']})", "inline": True})
+            if "strong" in cvd["interpretation"]:
+                triggers.append(f"cvd_{cvd['interpretation']}")
+
+        lt = flow.get("large_trades_1h")
+        if lt and lt["total_large_trades"] > 0:
+            fields.append({"name": "Large trades 1h", "value": f"{lt['total_large_trades']} trades, net ${lt['net_notional_usdt']:+,.0f}", "inline": False})
+            if abs(lt["net_notional_usdt"]) >= self.THRESHOLDS["large_net_usdt"]:
+                triggers.append(f"large_net_{'buy' if lt['net_notional_usdt']>0 else 'sell'}")
+
+        return fields, triggers
+
+    def run(self, ctx: dict) -> None:
+        client: Client = ctx["client"]
+        state: dict = ctx["state"]
+        whale_seen = state.setdefault("whale_seen", {})  # key: "SYMBOL|trigger" -> ts
+        now = time.time()
+        dedupe_window = self.DEDUPE_MINUTES * 60
+
+        # Pick top-volume USDT pairs
+        try:
+            tickers = client.get_ticker()
+        except Exception as e:
+            log.warning(f"whale_watch: ticker fetch failed: {e}")
+            return
+        usdts = [t for t in tickers if t["symbol"].endswith("USDT") and not t["symbol"].endswith("UPUSDT") and not t["symbol"].endswith("DOWNUSDT")]
+        usdts.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
+        symbols = [t["symbol"] for t in usdts[: self.top_n]]
+
+        alerts_sent = 0
+        for sym in symbols:
+            try:
+                flow = whale_flow.whale_flow_summary(client, sym)
+                fields, triggers = self._trigger_fields(flow)
+                # filter dedupe
+                fresh = [t for t in triggers if (now - whale_seen.get(f"{sym}|{t}", 0)) > dedupe_window]
+                if not fresh:
+                    continue
+                color = "green" if any("buy" in t or "accumulation" in t for t in fresh) else \
+                        "red" if any("sell" in t or "distribution" in t for t in fresh) else "purple"
+                if notify.whale_event(sym, ", ".join(fresh), fields, color=color):
+                    alerts_sent += 1
+                    for t in fresh:
+                        whale_seen[f"{sym}|{t}"] = now
+                    # Hand long-favoring whale events to the agent
+                    if any(("buy" in t) or ("accumulation" in t) or ("deeply_negative" in t) for t in fresh):
+                        try:
+                            current_price = float(client.get_symbol_ticker(symbol=sym)["price"])
+                        except Exception:
+                            current_price = None
+                        claude_agent.enqueue_event(state, {
+                            "symbol": sym,
+                            "trigger": f"whale_{','.join(fresh)[:80]}",
+                            "type": "whale",
+                            "current_price": current_price,
+                            "direction": "long",
+                        })
+            except Exception as e:
+                log.debug(f"whale_watch {sym}: {e}")
+
+        # Trim old dedupe entries
+        cutoff = now - 24 * 3600
+        for k in list(whale_seen.keys()):
+            if whale_seen[k] < cutoff:
+                del whale_seen[k]
+
+        save_state(state)
+        log.info(f"whale_watch: scanned {len(symbols)} symbols, sent {alerts_sent} alerts")
+
+
 class StartupJob(Job):
     name = "startup"
     interval = 10**9  # never repeats
@@ -664,12 +797,14 @@ def main() -> None:
     client = get_client()
     state = load_state()
 
-    jobs: list[Job] = [
+    jobs: list = [
         StartupJob(),
         PositionMonitorJob(),
         PartialTPJob(),
         SetupScannerJob(),
+        WhaleWatchJob(),
         DailyReportJob(),
+        claude_agent.ClaudeAgentJob(),
     ]
 
     ctx = {"client": client, "state": state}
