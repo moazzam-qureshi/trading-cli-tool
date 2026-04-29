@@ -64,15 +64,32 @@ Do:
 | Volume spike on entry candle | ⭐ | Bonus |
 | LTF RSI in healthy zone (not extreme) | ⭐ | Bonus |
 
-**Minimum 8/10 to enter. Below 8 = skip.** No exceptions, even for "pretty" setups.
+**Minimum 9/10 to enter. Below 9 = skip.** Updated from 8 after 6-month backtest: score-9 setups have ~50% better expectancy than score-8 (avgR +0.15 vs +0.10) over 1246 trades on BTC/ETH/SOL/BNB. Daemon scanner still alerts at 8 for visibility, but the entry bar is 9.
 
 ### Risk Rules (NEVER violate)
 
 - Risk per trade: **1-2% of current account balance**
-- Minimum R:R: **2:1** (target reward must be ≥ 2× the stop distance)
+- Target R:R: **1.5:1** (was 2:1; 6mo backtest shows 1.5R outperforms — price stalls between 1.5-2R often enough that the extra patience costs more than it pays. WR 41.6% at 1.5R/9 vs 31.4% at 2R/8.)
 - Stop placement: **at the technical invalidation level** (e.g., below the swept low)
 - **NEVER move stops tighter** mid-trade. Stop is at invalidation. If it hits, the setup was wrong, period.
 - **NEVER move stops wider** to avoid being stopped out. That's revenge trading.
+
+### Symbol focus (from 6mo backtest)
+
+| Symbol | Trades (1.5R/9) | WR%  | avgR  | 6mo return |
+|--------|-----------------|------|-------|------------|
+| BTC    | 304             | 43.8 | +0.20 | +200%      |
+| SOL    | 306             | 41.8 | +0.19 | +189%      |
+| BNB    | 315             | 42.5 | +0.15 | +137%      |
+| ETH    | 321             | 38.3 | +0.06 | +38%       |
+
+**Trade BTC, SOL, BNB. Skip ETH** unless setup is exceptional (10/10 with everything aligned).
+
+### Things tested and rejected
+
+- Partial-TP 50% @ 1R + BE: actually *reduces* avgR over 6mo (+0.10 → +0.03). Capping winners at 1.5R costs more than the saved-stop trades give back. Don't use.
+- Score 10 minimum: too few trades, edge collapses (avgR +0.01 at 1.5R, –0.04 at 3R).
+- 3R, 4R, 5R targets: same total expectancy as 2R but lower WR (11–22%) → harder psychology, more clustered drawdowns, slower compounding.
 
 ---
 
@@ -163,9 +180,9 @@ These are non-negotiable habits:
 
 1. **Every Binance action goes through `trade.py`.** No inline Python scripts. If a feature is missing, **add it to the CLI first**, then use it.
 2. **Per-trade approval before placing real-money orders.** Always.
-3. **Confluence ≥ 8/10 to enter.** No exceptions.
+3. **Confluence ≥ 9/10 to enter.** No exceptions. (Updated from 8 after backtest validation.)
 4. **Risk ≤ 2% per trade.** Use `trade.py size` to calculate, never eyeball.
-5. **R:R ≥ 2:1** at entry. If math doesn't work, skip.
+5. **R:R = 1.5:1** at entry. (Updated from 2:1 — backtest-optimized for compounding.)
 6. **Stops stay where they are.** Don't move tighter, don't move wider, don't cancel hoping price recovers.
 7. **OCO is mandatory.** No "I'll watch the chart and exit manually." Server-side stops are non-negotiable.
 8. **Journal every trade.** Entry: reasoning. Exit: outcome + lesson.
@@ -180,7 +197,7 @@ These are non-negotiable habits:
 - ❌ Don't suggest shorting (no shorts on spot)
 - ❌ Don't recommend trades during the user's overnight hours unless they explicitly ask
 - ❌ Don't average down on losers (martingale = blowup)
-- ❌ Don't suggest "this time is different" trades that violate the 8/10 confluence rule
+- ❌ Don't suggest "this time is different" trades that violate the 9/10 confluence rule
 - ❌ Don't write theory lessons unless asked — show, don't tell
 - ❌ Don't deploy code changes without testing locally first
 - ❌ Don't push secrets to git — `.env` is the only place for keys
@@ -189,10 +206,12 @@ These are non-negotiable habits:
 
 ## Current State (update this section after major changes)
 
-- Account starting balance: $150 USDT (initial deposit, ~Apr 28 2026)
+- Account starting balance: $150 USDT (initial deposit, ~Apr 28 2026); current ~$166 free.
 - First trade: **RIFUSDT** — entered as a "trend chase" before the toolkit existed. Closed near breakeven (-$0.05 in fees). Lesson: never trade without confluence scoring first.
-- Second trade: **SOLUSDT long** — entered Apr 28 2026 at $83.74 with confluence 9/10 (later rescored 10/10 after entry as volume confirmed). Stop $82.95, target $85.50, R:R 2.07:1.
-- Daemon: deployed to Hetzner VPS via Docker on Apr 28 2026.
+- Second trade: **SOLUSDT long** (Apr 28 2026, score 10/10) — entry $83.74, exit $83.82 at scratch (-$0.18 net). Closed early to extend backtest, validate partial-TP+BE, and prove edge before scaling. Lesson: even A+ setups can stall in chop.
+- Toolkit additions Apr 28-29 2026: backtest engine (paginated klines, vectorized 22× faster), partial-TP/BE-move daemon job, daily-loss circuit breaker, journal analytics, auto-journal at buy, net-P&L from fills.
+- Backtest evidence (6mo, BTC/ETH/SOL/BNB): rule "1.5R + score 9" outperforms — +0.15 avgR over 1246 trades. Old defaults (2R/8, partial-TP) replaced.
+- Daemon: deployed to Hetzner VPS via Docker on Apr 28 2026 (this machine). Container limits bumped to cpus:8 / mem:4g. Scanner alerts at 8 (visibility); trading bar is 9.
 
 ---
 
