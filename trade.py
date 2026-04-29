@@ -669,19 +669,24 @@ def setup_scan(quote, top, min_score, json_out):
 @click.option("--equity", default=150.0, help="Starting equity for compounding sim")
 @click.option("--partial-pct", default=0.0, help="%% of position to close at partial_at_r (0=disabled)")
 @click.option("--partial-at-r", default=1.0)
+@click.option("--trail-mode", default="off", type=click.Choice(["off", "be"]))
+@click.option("--trail-at-r", default=1.0)
 @click.option("--fast/--slow", default=True, help="Use vectorized engine (default: fast)")
 @click.option("--show-trades", is_flag=True, help="Print every simulated trade")
 @click.option("--json", "json_out", is_flag=True)
-def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, partial_pct, partial_at_r, fast, show_trades, json_out):
+def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, partial_pct, partial_at_r,
+             trail_mode, trail_at_r, fast, show_trades, json_out):
     """Backtest the confluence strategy on historical data."""
     import backtest as bt
     client = get_client()
     runner = bt.run_backtest_fast if fast else bt.run_backtest
+    extra = {"trail_mode": trail_mode, "trail_at_r": trail_at_r} if fast else {}
     result = runner(
         client, symbol.upper(),
         bars_15m=bars, min_score=min_score, rr=rr,
         max_hold_bars=max_hold, risk_pct=risk_pct, starting_equity=equity,
         partial_pct=partial_pct, partial_at_r=partial_at_r,
+        **extra,
     )
     if json_out:
         out(result)
@@ -760,19 +765,25 @@ def backtest_multi(symbols, bars, min_score, rr, partial_pct, partial_at_r, json
 @click.option("--partial-pct", default=0.0)
 @click.option("--partial-at-r", default=1.0)
 @click.option("--score-every-n", default=4, help="Score every Nth 15m bar (4 = hourly, default for speed)")
+@click.option("--trail-mode", default="off", type=click.Choice(["off", "be"]), help="Stop-trail: 'be' = move stop to entry at trail_at_r")
+@click.option("--trail-at-r", default=1.0, help="R-multiple at which to arm BE-trail")
 @click.option("--fast/--slow", default=True, help="Use vectorized engine (default: fast)")
 @click.option("--json", "json_out", is_flag=True)
-def backtest_sweep(symbols, bars, scores, rr, partial_pct, partial_at_r, score_every_n, fast, json_out):
+def backtest_sweep(symbols, bars, scores, rr, partial_pct, partial_at_r, score_every_n,
+                   trail_mode, trail_at_r, fast, json_out):
     """Sweep min_score thresholds to find where edge appears."""
     import backtest as bt
     client = get_client()
     syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     score_list = [int(s) for s in scores.split(",")]
+    if not fast and trail_mode != "off":
+        raise click.ClickException("trail-mode only supported on the fast engine")
     runner = bt.run_score_sweep_fast if fast else bt.run_score_sweep
+    extra = {"trail_mode": trail_mode, "trail_at_r": trail_at_r} if fast else {}
     result = runner(client, syms, score_list,
                     bars_15m=bars, rr=rr,
                     partial_pct=partial_pct, partial_at_r=partial_at_r,
-                    score_every_n=score_every_n)
+                    score_every_n=score_every_n, **extra)
     if json_out:
         out(result)
         return

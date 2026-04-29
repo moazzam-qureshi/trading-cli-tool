@@ -323,6 +323,8 @@ def run_backtest_fast(
     score_every_n: int = 1,
     htf_bars: int = 5000,    # plenty for 6mo coverage
     mtf_bars: int = 5000,
+    trail_mode: str = "off",     # "off" | "be" (move stop to entry at trail_at_r)
+    trail_at_r: float = 1.0,
 ) -> dict:
     """Same engine as run_backtest but uses precompute() + score_at() — ~50× faster.
 
@@ -373,6 +375,24 @@ def run_backtest_fast(
             partial_frac = partial_pct / 100.0
             remainder_frac = 1 - partial_frac
 
+            # BE-trail check: if armed and price has reached trail_at_r, ratchet stop to entry.
+            # Conservative ordering: stop check uses the new (tighter) stop ONLY if the bar's
+            # high reached the trigger BEFORE the bar's low touched the original stop. Since
+            # we can't know intra-bar order, we apply the conservative rule:
+            #   - if both old-stop AND trail-trigger could have hit → assume old-stop first (lose)
+            #   - if only trail-trigger could have hit → arm BE (move effective_stop to entry)
+            if trail_mode == "be" and t.effective_stop < t.entry:
+                trail_trigger = (t.entry + trail_at_r * risk_per) if t.direction == "long" \
+                                else (t.entry - trail_at_r * risk_per)
+                if t.direction == "long":
+                    trail_armed = high >= trail_trigger
+                    bar_might_have_stopped = low <= t.effective_stop
+                else:
+                    trail_armed = low <= trail_trigger
+                    bar_might_have_stopped = high >= t.effective_stop
+                if trail_armed and not bar_might_have_stopped:
+                    t.effective_stop = t.entry  # arm BE
+
             if t.direction == "long":
                 stop_hit = low <= t.effective_stop
                 target_hit = high >= t.target
@@ -385,7 +405,13 @@ def run_backtest_fast(
             if not t.partial_taken:
                 if stop_hit:
                     t.exit_time = ts.isoformat(); t.exit = t.effective_stop
-                    t.outcome = "LOSS"; t.r_multiple = -1.0; t.bars_held = held
+                    # R against ORIGINAL risk: BE-trailed stop hits at 0R, original stop = -1R
+                    if t.direction == "long":
+                        r = (t.effective_stop - t.entry) / risk_per
+                    else:
+                        r = (t.entry - t.effective_stop) / risk_per
+                    t.outcome = "BE_STOP" if abs(r) < 0.001 else "LOSS"
+                    t.r_multiple = round(r, 3); t.bars_held = held
                     trades.append(t); open_trade = None; continue
                 if partial_pct > 0 and partial_hit:
                     t.partial_taken = True; t.effective_stop = t.entry
@@ -458,7 +484,8 @@ def run_backtest_fast(
 
     # ── stats (same as run_backtest) ──
     WIN_OUTCOMES = ("WIN", "WIN_PARTIAL_BE", "WIN_PARTIAL_TARGET")
-    closed = [t for t in trades if t.outcome in WIN_OUTCOMES + ("LOSS", "TIMEOUT")]
+    closed = [t for t in trades if t.outcome in WIN_OUTCOMES + ("LOSS", "TIMEOUT", "BE_STOP")]
+    be_stops = len([t for t in closed if t.outcome == "BE_STOP"])
     wins = [t for t in closed if t.outcome in WIN_OUTCOMES]
     losses = [t for t in closed if t.outcome == "LOSS"]
     timeouts = [t for t in closed if t.outcome == "TIMEOUT"]
@@ -492,6 +519,7 @@ def run_backtest_fast(
         "stats": {
             "total_signals": len(trades), "closed": len(closed),
             "wins": len(wins), "losses": len(losses), "timeouts": len(timeouts),
+            "be_stops": be_stops,
             "win_rate_pct": round(win_rate, 1),
             "avg_r": round(avg_r, 2), "total_r": round(total_r, 2),
             "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else "inf",
