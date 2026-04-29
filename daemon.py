@@ -414,6 +414,48 @@ class PartialTPJob(Job):
 # SetupScannerJob — periodic A+ setup scans
 # ──────────────────────────────────────────────────────────────────
 
+PRIMARY_SYMBOLS = {"BTCUSDT", "SOLUSDT", "BNBUSDT"}  # validated edge in 6mo backtest
+TARGET_RR = float(os.getenv("DAEMON_TARGET_RR", 1.5))
+PRIMARY_MIN_SCORE = int(os.getenv("DAEMON_PRIMARY_MIN_SCORE", 9))   # tradeable bar
+SECONDARY_MIN_SCORE = int(os.getenv("DAEMON_SECONDARY_MIN_SCORE", 10))  # other coins must be 10/10 to alert
+
+
+def _suggest_levels(client: Client, symbol: str, direction: str, current_price: float) -> Optional[dict]:
+    """Suggest entry/stop/target from current LTF structure. Stop = recent opposing swing."""
+    try:
+        ltf_df = analysis.fetch_klines(client, symbol, "15m", 200)
+    except Exception:
+        return None
+    swings = analysis.detect_swings(ltf_df)
+    atr_v = float(analysis.atr(ltf_df).iloc[-1])
+    entry = current_price
+    stop = None
+    if direction == "long":
+        for s in reversed(swings):
+            if s.kind in ("HL", "LL", "L") and s.price < entry:
+                stop = s.price * 0.999  # 0.1% buffer
+                break
+        if stop is None:
+            stop = entry - 1.5 * atr_v
+        if stop >= entry:
+            return None
+        target = entry + TARGET_RR * (entry - stop)
+    else:
+        for s in reversed(swings):
+            if s.kind in ("HH", "LH", "H") and s.price > entry:
+                stop = s.price * 1.001
+                break
+        if stop is None:
+            stop = entry + 1.5 * atr_v
+        if stop <= entry:
+            return None
+        target = entry - TARGET_RR * (stop - entry)
+
+    if abs(entry - stop) / entry < 0.001:
+        return None  # noise stop
+    return {"entry": entry, "stop": stop, "target": target, "rr": TARGET_RR}
+
+
 class SetupScannerJob(Job):
     name = "setup_scanner"
 
@@ -421,49 +463,82 @@ class SetupScannerJob(Job):
         super().__init__()
         self.interval = int(os.getenv("DAEMON_SCANNER_INTERVAL", 1800))
         self.top = int(os.getenv("DAEMON_SCAN_TOP", 30))
-        self.min_score = int(os.getenv("DAEMON_SCAN_MIN_SCORE", 8))
+        # Lowest score we BOTHER to score-fully (saves API). The actual alert filter
+        # is applied per-symbol via PRIMARY/SECONDARY_MIN_SCORE.
+        self.scan_floor = int(os.getenv("DAEMON_SCAN_FLOOR", 8))
 
     def run(self, ctx: dict) -> None:
         client: Client = ctx["client"]
         state: dict = ctx["state"]
-        seen = state.setdefault("scanner_seen", {})  # symbol -> last_alert_ts
+        seen = state.setdefault("scanner_seen", {})
 
-        log.info(f"Scanner running — top {self.top} pairs, min score {self.min_score}")
+        log.info(f"Scanner running — top {self.top}, primary≥{PRIMARY_MIN_SCORE}, "
+                 f"others≥{SECONDARY_MIN_SCORE}, RR target {TARGET_RR}")
         tickers = client.get_ticker()
         candidates = sorted(
             [t for t in tickers if t["symbol"].endswith("USDT")],
             key=lambda t: float(t["quoteVolume"]),
             reverse=True,
         )[:self.top]
+        # Always include primary symbols even if outside top-N
+        symbols = {t["symbol"] for t in candidates} | PRIMARY_SYMBOLS
 
-        results = []
-        for t in candidates:
+        tradeable: list[dict] = []
+        watching: list[dict] = []
+        for sym in symbols:
             try:
-                r = analysis.confluence_score(client, t["symbol"])
-                if r["score"] >= self.min_score:
-                    results.append(r)
+                r = analysis.confluence_score(client, sym)
             except Exception as e:
-                log.warning(f"Scan {t['symbol']} failed: {e}")
+                log.warning(f"Scan {sym} failed: {e}")
+                continue
+            if r["score"] < self.scan_floor:
+                continue
+            is_primary = sym in PRIMARY_SYMBOLS
+            min_for_alert = PRIMARY_MIN_SCORE if is_primary else SECONDARY_MIN_SCORE
+            r["primary"] = is_primary
+            if r["score"] >= min_for_alert:
+                tradeable.append(r)
+            else:
+                watching.append(r)
 
         # Re-alert each symbol at most every 4 hours
         now = time.time()
-        new_setups = []
-        for r in results:
+        fresh_tradeable = []
+        for r in tradeable:
             sym = r["symbol"]
-            last = seen.get(sym, 0)
-            if now - last >= 4 * 3600:
-                new_setups.append(r)
+            if now - seen.get(sym, 0) >= 4 * 3600:
+                fresh_tradeable.append(r)
                 seen[sym] = now
 
-        log.info(f"Scanner found {len(results)} setups, {len(new_setups)} are fresh alerts")
+        log.info(f"Scanner: tradeable={len(tradeable)} (fresh={len(fresh_tradeable)}), "
+                 f"watching={len(watching)}")
 
-        if new_setups:
-            lines = [f"**A+ Setup Scan — {utcnow().strftime('%H:%M UTC')}**"]
-            for r in new_setups[:10]:
+        # Send rich per-symbol alerts for fresh tradeable setups
+        for r in fresh_tradeable:
+            sym = r["symbol"]
+            levels = _suggest_levels(client, sym, r["direction"], r["current_price"])
+            if not levels:
+                log.info(f"{sym}: skipping alert (couldn't compute levels)")
+                continue
+            try:
+                notify.setup_alert(
+                    symbol=sym, score=r["score"], direction=r["direction"],
+                    current_price=r["current_price"],
+                    suggested_entry=levels["entry"], suggested_stop=levels["stop"],
+                    suggested_target=levels["target"], rr=levels["rr"],
+                    primary=r["primary"], reasons=r.get("reasons", []),
+                )
+            except Exception as e:
+                log.error(f"setup_alert failed for {sym}: {e}")
+
+        # Compact roll-up of "watching" list if non-empty (informational)
+        if watching:
+            watching.sort(key=lambda r: r["score"], reverse=True)
+            lines = [f"**Watching ({utcnow().strftime('%H:%M UTC')}):**"]
+            for r in watching[:8]:
                 arrow = "🟢" if r["direction"] == "long" else "🔴"
-                lines.append(f"{arrow} **{r['symbol']}** — {r['score']}/10 — {r['direction']} @ ${r['current_price']}")
-                for reason in r["reasons"][:3]:
-                    lines.append(f"   · {reason}")
+                tag = " ⭐" if r["primary"] else ""
+                lines.append(f"{arrow} {r['symbol']}{tag} — {r['score']}/10 {r['direction']} @ ${r['current_price']}")
             notify.send("scanner", content="\n".join(lines)[:1900], fallback_to="signals")
 
         save_state(state)

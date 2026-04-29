@@ -177,6 +177,37 @@ def daily_report(date_str: str, stats: dict, today_trades: list[dict]) -> None:
     send("reports", embed=embed, fallback_to="signals")
 
 
+def setup_alert(symbol: str, score: int, direction: str, current_price: float,
+                suggested_entry: float, suggested_stop: float, suggested_target: float,
+                rr: float, primary: bool, reasons: list[str]) -> None:
+    """Rich alert for an A+ setup found by the scanner. Includes the trade.py command for copy-paste."""
+    color = "green" if direction == "long" else "red"
+    badge = "⭐ PRIMARY" if primary else "FYI"
+    risk_pct = abs(suggested_entry - suggested_stop) / suggested_entry * 100
+    reward_pct = abs(suggested_target - suggested_entry) / suggested_entry * 100
+    cmd = (f"`trade.py buy {symbol} --usd <SIZE> "
+           f"--stop {suggested_stop:.6f} --target {suggested_target:.6f}`")
+    fields = [
+        {"name": "Score", "value": f"{score}/10 {badge}", "inline": True},
+        {"name": "Direction", "value": direction.upper(), "inline": True},
+        {"name": "Price", "value": f"${current_price:.6f}", "inline": True},
+        {"name": "Entry", "value": f"${suggested_entry:.6f}", "inline": True},
+        {"name": "Stop", "value": f"${suggested_stop:.6f} (-{risk_pct:.2f}%)", "inline": True},
+        {"name": "Target", "value": f"${suggested_target:.6f} (+{reward_pct:.2f}%)", "inline": True},
+        {"name": "R:R", "value": f"{rr:.2f}:1", "inline": True},
+    ]
+    desc = "**Confluences:**\n" + "\n".join(f"• {r}" for r in reasons[:6])
+    desc += f"\n\n**Command (after your size decision):**\n{cmd}"
+    embed = _embed(
+        title=f"{'🟢' if direction == 'long' else '🔴'} {symbol} — A+ setup ({score}/10)",
+        description=desc,
+        color=color,
+        fields=fields,
+    )
+    # Tradeable setups (primary + score 9+) go to scanner channel; others go too but tagged
+    send("scanner", embed=embed, fallback_to="signals")
+
+
 def system_alert(level: str, message: str, details: str = "") -> None:
     """System health alerts: errors, restarts, API outages."""
     color = "red" if level.upper() == "ERROR" else "yellow" if level.upper() == "WARN" else "blue"
