@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
@@ -797,10 +798,33 @@ def score_from_dfs(htf_df: pd.DataFrame, mtf_df: pd.DataFrame, ltf_df: pd.DataFr
     }
 
 
+MIN_ATR_PCT_OF_PRICE = float(os.getenv("MIN_ATR_PCT_OF_PRICE", 0.15))
+
+
 def confluence_score(client: Client, symbol: str) -> dict:
     """Score a symbol for A+ setup probability across multiple TFs."""
-    htf = analyze_symbol(client, symbol, "4h", 300)
     mtf = analyze_symbol(client, symbol, "1h", 300)
+
+    # Volatility floor — pegged stables (USD1, U, FDUSD, USDC etc.) and dead-on-arrival
+    # micro-caps print 1h ATR%/price < 0.15% which is just rounding noise. SMC analysis
+    # on those is meaningless; the swing detector finds "structure" in nothing. Bail
+    # before burning more API calls + agent budget.
+    atr_pct = mtf["indicators"].get("atr_pct", 0)
+    if atr_pct is not None and atr_pct < MIN_ATR_PCT_OF_PRICE:
+        return {
+            "symbol": symbol.upper(),
+            "score": 0,
+            "max_score": 10,
+            "verdict": "skip — pegged/illiquid",
+            "direction": None,
+            "reasons": [f"1h ATR/price {atr_pct}% < {MIN_ATR_PCT_OF_PRICE}% floor (likely stable / pegged)"],
+            "current_price": mtf["current_price"],
+            "structure": {"htf": "n/a", "mtf": "n/a", "ltf": "n/a"},
+            "atr_pct": atr_pct,
+            "pegged": True,
+        }
+
+    htf = analyze_symbol(client, symbol, "4h", 300)
     ltf = analyze_symbol(client, symbol, "15m", 300)
 
     score = 0
