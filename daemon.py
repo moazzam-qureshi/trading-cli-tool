@@ -450,7 +450,7 @@ class LimitFillMonitorJob(Job):
     def __init__(self):
         super().__init__()
         self.interval = int(os.getenv("DAEMON_LIMIT_MONITOR_INTERVAL", 30))
-        self.enabled = os.getenv("DAEMON_ENABLE_LIMIT_MONITOR", "false").lower() == "true"
+        self.enabled = os.getenv("DAEMON_ENABLE_LIMIT_MONITOR", "true").lower() == "true"
 
     def run(self, ctx: dict) -> None:
         if not self.enabled:
@@ -610,6 +610,18 @@ ENABLE_OTE_FILTER = os.getenv("DAEMON_ENABLE_OTE", "false").lower() == "true"   
 ENABLE_CEILING_FILTER = os.getenv("DAEMON_ENABLE_CEILING", "true").lower() == "true"
 ENABLE_VSA_FILTER = os.getenv("DAEMON_ENABLE_VSA", "false").lower() == "true"       # VSA up-thrust hard-reject; backtest regressed (-29% avgR), off by default
 
+# Limit-at-sweep auto-placement (the "buy the test" entry pattern).
+# When SetupScannerJob finds a fresh score-9 long with a recent MTF bullish_sweep,
+# place a LIMIT BUY just above the sweep dip instead of routing to the agent for
+# a market entry. Hard caps below prevent runaway placement on a buggy setup.
+ENABLE_AUTO_LIMIT_AT_SWEEP = os.getenv("DAEMON_ENABLE_AUTO_LIMIT", "true").lower() == "true"
+AUTO_LIMIT_PREMIUM = float(os.getenv("DAEMON_AUTO_LIMIT_PREMIUM", 0.001))   # 0.1% above sweep dip
+AUTO_LIMIT_EXPIRY_HOURS = float(os.getenv("DAEMON_AUTO_LIMIT_EXPIRY_HOURS", 6))
+AUTO_LIMIT_DAILY_CAP = int(os.getenv("DAEMON_AUTO_LIMIT_DAILY_CAP", 5))     # max placements/day
+AUTO_LIMIT_PER_SYMBOL_COOLDOWN_HOURS = float(os.getenv("DAEMON_AUTO_LIMIT_COOLDOWN_HOURS", 24))
+AUTO_LIMIT_USDT_PER_TRADE = float(os.getenv("DAEMON_AUTO_LIMIT_USDT", 30))  # $ per auto-placed limit
+AUTO_LIMIT_MAX_PENDING = int(os.getenv("DAEMON_AUTO_LIMIT_MAX_PENDING", 3)) # cap concurrent unfilled limits
+
 
 def _tf_aligned(r: dict) -> bool:
     """All 3 TFs structurally agree with the trade direction."""
@@ -618,6 +630,84 @@ def _tf_aligned(r: dict) -> bool:
         return False
     target = "Bullish" if direction == "long" else "Bearish"
     return r.get("htf_trend") == target and r.get("mtf_trend") == target and r.get("ltf_trend") == target
+
+
+def _try_auto_limit_at_sweep(client: Client, state: dict, r: dict) -> tuple[bool, str]:
+    """Place a LIMIT BUY at the swept swing-low if conditions allow.
+
+    Returns (placed, reason). On success the buy-limit intent is persisted by
+    place_buy_limit_intent and LimitFillMonitorJob will attach OCO on fill.
+    """
+    sym = r["symbol"]
+    if not ENABLE_AUTO_LIMIT_AT_SWEEP:
+        return False, "auto-limit disabled"
+    if r.get("direction") != "long":
+        return False, "non-long (spot only)"
+
+    pending = state.setdefault("limit_intents", {})
+    if len(pending) >= AUTO_LIMIT_MAX_PENDING:
+        return False, f"max pending limits reached ({len(pending)}/{AUTO_LIMIT_MAX_PENDING})"
+
+    last_attempts: dict = state.setdefault("auto_limit_last", {})
+    last = float(last_attempts.get(sym, 0))
+    if time.time() - last < AUTO_LIMIT_PER_SYMBOL_COOLDOWN_HOURS * 3600:
+        return False, f"{sym} cooldown ({AUTO_LIMIT_PER_SYMBOL_COOLDOWN_HOURS}h)"
+
+    today = utcnow().strftime("%Y-%m-%d")
+    daily: dict = state.setdefault("auto_limit_daily", {"date": today, "count": 0})
+    if daily.get("date") != today:
+        daily.update({"date": today, "count": 0})
+    if daily["count"] >= AUTO_LIMIT_DAILY_CAP:
+        return False, f"daily cap ({AUTO_LIMIT_DAILY_CAP})"
+
+    # Need a fresh bullish_sweep on MTF — that's the orthodox "buy the test" trigger
+    try:
+        mtf_df = analysis.fetch_klines(client, sym, "1h", 200)
+    except Exception as e:
+        return False, f"mtf fetch failed: {e}"
+    swings = analysis.detect_swings(mtf_df)
+    sweep = analysis.detect_sweep(mtf_df, swings)
+    if not sweep or sweep.get("type") != "bullish_sweep":
+        return False, "no bullish_sweep on MTF"
+
+    sweep_dip = float(sweep["dip"])
+    current = float(r["current_price"])
+    limit_price = sweep_dip * (1 + AUTO_LIMIT_PREMIUM)
+    if limit_price >= current:
+        return False, f"limit {limit_price:.6f} ≥ current {current} (no dip room)"
+
+    # Stop = small buffer below the sweep low. Target = 1.5R.
+    stop_price = sweep_dip * 0.995
+    if stop_price >= limit_price:
+        return False, "stop ≥ limit"
+    target_price = limit_price + TARGET_RR * (limit_price - stop_price)
+
+    # Apply ceiling filter pre-placement (same gate as market-buy path)
+    if ENABLE_CEILING_FILTER:
+        tr = analysis.target_reachable("long", limit_price, target_price, mtf_df,
+                                       lookback=CEILING_LOOKBACK)
+        if not tr["reachable"]:
+            return False, f"ceiling: {tr.get('reason')}"
+
+    # All gates passed — place via the shared helper in trade.py.
+    import trade as trade_mod
+    try:
+        intent = trade_mod.place_buy_limit_intent(
+            client, sym, usd=AUTO_LIMIT_USDT_PER_TRADE,
+            limit_price=limit_price, stop=stop_price, target=target_price,
+            expiry_hours=AUTO_LIMIT_EXPIRY_HOURS,
+            reason=f"auto-limit-at-sweep score={r.get('score')} sweep_dip={sweep_dip}",
+            setup="limit_at_sweep_auto",
+        )
+    except Exception as e:
+        log.error(f"auto-limit place failed for {sym}: {e}")
+        return False, f"place failed: {e}"
+
+    last_attempts[sym] = time.time()
+    daily["count"] = int(daily.get("count", 0)) + 1
+    save_state(state)
+    log.info(f"auto-limit placed {sym} @ {limit_price:.6f} (sweep_dip={sweep_dip}, target={target_price:.6f})")
+    return True, f"placed @ {limit_price}"
 
 
 def _suggest_levels(client: Client, symbol: str, direction: str, current_price: float) -> Optional[dict]:
@@ -784,15 +874,23 @@ class SetupScannerJob(Job):
             except Exception as e:
                 log.error(f"setup_alert failed for {sym}: {e}")
 
-            # Hand fresh tradeable setups to the autonomous agent for 3-layer evaluation
-            if r["direction"] == "long":  # spot-only — agent rejects non-longs anyway, but skip the noise
-                claude_agent.enqueue_event(state, {
-                    "symbol": sym,
-                    "trigger": f"setup_scan_score_{r['score']}",
-                    "type": "setup",
-                    "current_price": r["current_price"],
-                    "direction": r["direction"],
-                })
+            # Try the orthodox "buy the test" entry first: place a LIMIT at the
+            # swept swing-low, let price retest. Only falls through to a market-
+            # entry agent review if no usable bullish_sweep exists or a safety
+            # cap blocks the placement.
+            if r["direction"] == "long":  # spot-only
+                placed, reason = _try_auto_limit_at_sweep(client, state, r)
+                if placed:
+                    log.info(f"{sym}: routed to auto-limit-at-sweep — skipping agent market eval")
+                else:
+                    log.info(f"{sym}: auto-limit skipped ({reason}) — handing to agent for evaluation")
+                    claude_agent.enqueue_event(state, {
+                        "symbol": sym,
+                        "trigger": f"setup_scan_score_{r['score']}",
+                        "type": "setup",
+                        "current_price": r["current_price"],
+                        "direction": r["direction"],
+                    })
 
         # Compact roll-up of "watching" list if non-empty (informational)
         if watching:

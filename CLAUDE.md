@@ -110,9 +110,17 @@ Even when all 3 layers pass, two structural gates apply *automatically* in `daem
 
 - **VSA up-thrust hard-reject** (`DAEMON_ENABLE_VSA=false` — currently OFF). The detector exists but ships disabled; backtest regressed at default thresholds. **However**, `vsa_ltf` and `vsa_mtf` fields are still computed and surfaced in agent prompts and Discord alerts. The agent must **read them as judgment input**: a recent up-thrust is a strong "be cautious" signal, just not strong enough to auto-reject. See "When VSA is enabled" under Autonomous Agent Mode for what to do when threshold tuning eventually re-enables the gate.
 
-### Late-entry / "buy the test" entry
+### Late-entry / "buy the test" entry — DEFAULT live mode
 
-The OTE/Wyckoff orthodox entry is a **LIMIT BUY** placed just above the swept swing-low zone, not a MARKET BUY after the sweep has already played out. Use `trade.py buy-limit` (see Toolkit) for this pattern. The daemon's `LimitFillMonitorJob` will auto-attach OCO on fill and cancel the order if price doesn't return to the level within `--expiry-hours` — built-in "no chase." Enabling auto-management requires `DAEMON_ENABLE_LIMIT_MONITOR=true`.
+The orthodox SMC/Wyckoff entry is a **LIMIT BUY** placed just above the swept swing-low zone, not a MARKET BUY after the sweep has already played out. This is the *default* live-trading mode now:
+
+1. `SetupScannerJob` finds a fresh score-9 long with a recent MTF `bullish_sweep`
+2. `_try_auto_limit_at_sweep` places a LIMIT BUY at `sweep_dip × 1.001` (just above the swept low) sized at `AUTO_LIMIT_USDT_PER_TRADE` (default $30); stop sits 0.5% below the sweep low; target = entry + 1.5R
+3. Limit-at-sweep ships behind safety caps: max 3 concurrent unfilled limits (`AUTO_LIMIT_MAX_PENDING`), 5/day (`AUTO_LIMIT_DAILY_CAP`), 24h per-symbol cooldown (`AUTO_LIMIT_PER_SYMBOL_COOLDOWN_HOURS`), 6h expiry per limit (`AUTO_LIMIT_EXPIRY_HOURS`). Same ceiling filter applies pre-placement.
+4. `LimitFillMonitorJob` polls every 30s. On fill → attaches OCO and journals. On expiry → cancels, no trade taken. **Built-in "no chase."**
+5. If no `bullish_sweep` exists at scan time, falls back to the existing flow: agent evaluates for a market entry under the 3-layer filter.
+
+For manual placement, use `trade.py buy-limit` (see Toolkit). All caps are env-toggleable; flip `DAEMON_ENABLE_AUTO_LIMIT=false` to revert to market-buy default.
 
 ---
 
