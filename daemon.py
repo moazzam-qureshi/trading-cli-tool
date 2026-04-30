@@ -673,6 +673,14 @@ def _try_auto_limit_at_sweep(client: Client, state: dict, r: dict) -> tuple[bool
     if r.get("direction") != "long":
         return False, "non-long (spot only)"
 
+    # Auto-limit is an autonomous flow like the agent — gate it with the agent
+    # breaker ($10 daily P&L / 5 trades), not the manual 2-loss rule.
+    agent_daily = claude_agent._agent_daily(state)
+    if agent_daily.get("breaker_tripped"):
+        return False, f"agent breaker tripped (pnl ${agent_daily.get('realized_pnl_usd', 0):+.2f})"
+    if agent_daily.get("trades_opened", 0) >= claude_agent.DAILY_TRADE_CAP:
+        return False, f"agent daily trade cap hit ({agent_daily['trades_opened']}/{claude_agent.DAILY_TRADE_CAP})"
+
     pending = state.setdefault("limit_intents", {})
     if len(pending) >= AUTO_LIMIT_MAX_PENDING:
         return False, f"max pending limits reached ({len(pending)}/{AUTO_LIMIT_MAX_PENDING})"
@@ -727,6 +735,7 @@ def _try_auto_limit_at_sweep(client: Client, state: dict, r: dict) -> tuple[bool
             expiry_hours=AUTO_LIMIT_EXPIRY_HOURS,
             reason=f"auto-limit-at-sweep score={r.get('score')} sweep_dip={sweep_dip}",
             setup="limit_at_sweep_auto",
+            check_breaker=False,
         )
     except Exception as e:
         log.error(f"auto-limit place failed for {sym}: {e}")

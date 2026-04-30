@@ -159,12 +159,13 @@ def price(symbol: str) -> None:
 @click.option("--slip", type=float, default=0.5, help="Stop-limit slippage % below stop (default 0.5)")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt")
 @click.option("--override-breaker", is_flag=True, help="Bypass the daily-loss circuit breaker (use with care)")
+@click.option("--agent", is_flag=True, help="Marks the trade as agent-placed; skips manual 2-loss breaker (agent's own $10/5 gate ran upstream)")
 @click.option("--partial-pct", type=float, default=None, help="%% of position to close at 1R (enables partial-TP + BE move)")
 @click.option("--partial-at-r", type=float, default=1.0, help="R-multiple at which to take partial (default 1.0)")
 @click.option("--reason", default="", help="Reasoning for the trade (auto-filled from confluence_score if empty)")
 @click.option("--setup", default="", help="Setup type label (e.g. 'OB+sweep'). Auto-filled if empty.")
 @click.option("--no-journal", is_flag=True, help="Skip auto-journaling")
-def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker,
+def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker, agent,
         partial_pct, partial_at_r, reason, setup, no_journal):
     """Buy + auto-attach OCO (stop + take-profit)."""
     client = get_client()
@@ -176,7 +177,7 @@ def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker,
     free_usdt = float(next((b for b in acc["balances"] if b["asset"] == "USDT"), {"free": "0"})["free"])
     # rough total (USDT + held positions estimated at last price) — use just free for breaker, conservative
     breaker = risk.check_trading_allowed(account_value=max(free_usdt, 1.0))
-    if not breaker["allowed"] and not override_breaker:
+    if not breaker["allowed"] and not override_breaker and not agent:
         out({"error": "Trading paused by circuit breaker", **breaker,
              "hint": "Use --override-breaker to bypass (don't, unless you have a really good reason)."})
         sys.exit(2)

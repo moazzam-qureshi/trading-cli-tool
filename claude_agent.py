@@ -400,6 +400,7 @@ def execute_buy(verdict: dict, client, state: dict) -> tuple[bool, str]:
         "--stop", f"{stop:.8f}",
         "--target", f"{target:.8f}",
         "--yes",
+        "--agent",
         "--reason", reason,
         "--setup", "agent",
     ]
