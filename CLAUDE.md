@@ -102,6 +102,18 @@ trade.py chart-multi SYMBOL                     # Layer 3 — render 5 TFs
 
 **Only after all three pass:** `trade.py size --risk X --entry ... --stop ... --target ...` then ask user for go.
 
+### Hard filters at trade-open
+
+Even when all 3 layers pass, two structural gates apply *automatically* in `daemon._suggest_levels` and `claude_agent.gates_for_buy`. If either rejects, the setup is dropped without notifying the user — these are non-judgment failures, not "Claude was wrong."
+
+- **Target reachability** (`analysis.target_reachable`, `DAEMON_ENABLE_CEILING=true`, lookback 160 × 1H ≈ 7 days). Rejects any setup whose 1.5R take-profit sits above the recent N-bar 1H high. Pure pro-trader principle: targets sit AT magnets (prior swing highs / supply zones), not floating in no-man's-land where price has never traded recently. Backtest validated: avgR +0.164 → +0.189 (+15%) over 4 OOS symbols; reproducible across two independent runs.
+
+- **VSA up-thrust hard-reject** (`DAEMON_ENABLE_VSA=false` — currently OFF). The detector exists but ships disabled; backtest regressed at default thresholds. **However**, `vsa_ltf` and `vsa_mtf` fields are still computed and surfaced in agent prompts and Discord alerts. The agent must **read them as judgment input**: a recent up-thrust is a strong "be cautious" signal, just not strong enough to auto-reject. See "When VSA is enabled" under Autonomous Agent Mode for what to do when threshold tuning eventually re-enables the gate.
+
+### Late-entry / "buy the test" entry
+
+The OTE/Wyckoff orthodox entry is a **LIMIT BUY** placed just above the swept swing-low zone, not a MARKET BUY after the sweep has already played out. Use `trade.py buy-limit` (see Toolkit) for this pattern. The daemon's `LimitFillMonitorJob` will auto-attach OCO on fill and cancel the order if price doesn't return to the level within `--expiry-hours` — built-in "no chase." Enabling auto-management requires `DAEMON_ENABLE_LIMIT_MONITOR=true`.
+
 ---
 
 ## Risk Rules (NEVER violate)
@@ -154,6 +166,8 @@ For unvetted alts: require liquidity (top ~100 USDT volume) + clean structure + 
 - **Partial-TP 50% @ 1R + BE move:** reduced avgR from +0.10 to +0.03. Capping winners costs more than saving stops returns.
 - **3R/4R/5R targets:** same total expectancy as 2R but worse WR (11-22%) → harder psychology, slower compounding.
 - **BTC/ETH-only universe:** capital-infeasible below $2k account.
+- **OTE 62% Fib retrace late-entry filter:** SMC-orthodox idea — reject longs above the 62% retrace of the impulse leg. Backtested at 0.50/0.62/0.79 thresholds; every threshold underperformed baseline (best: +0.122 vs baseline +0.164). Code retained in `analysis.ote_check`; `DAEMON_ENABLE_OTE=false` by default. Available for future tuning if a sharper impulse-leg detector is built.
+- **VSA up-thrust hard-reject (default thresholds):** rejected ~29% of trades on aggregate (+0.164 → +0.117 avgR). Detector is too noisy at vol_mult=1.3 / close_pos<0.5 / swing_lookback=10. Code stays in `analysis.vsa_bar`; threshold tuning is a tracked follow-up. VSA fields still feed the agent as judgment input.
 
 ---
 
@@ -358,20 +372,12 @@ When a whale alert fires on a symbol where we already hold an open long, the dae
 
 ---
 
-## Current State (update this section after major changes)
+## Current State (account/health only — keep this short)
 
 - Account: $150 USDT initial deposit Apr 28 2026; $155.78 free as of Apr 29 2026 EOD.
 - Trades to date: 5 (1 BE: SOL; 4 LOSS: MASK, AXS, SUI, APT). Total -$11.03 / -7%.
 - 4 of 5 trades had process violations (mid-session rule change, OCO bug, 2× breaker overrides). System edge has not been cleanly tested live yet.
-- 2026-04-29 toolkit additions: whale-flow module (`whale_flow.py`), whale Discord channel, charting module (`charting.py`) with multi-TF rendering, daemon `WhaleWatchJob`, 3-layer decision filter codified.
-- 2026-04-29 OOS backtest: aggregate +0.19 avgR over 188 trades on MASK/AXS/SUI/APT — system edge confirmed on alts. SUI dropped from universe.
-- Daemon: Hetzner VPS via Docker. Container limits cpus:8 / mem:4g. Healthy as of 2026-04-29.
-- 2026-04-30 added two pro-trader filters in `analysis.py` to address late-entry / fantasy-target failure modes observed live:
-  - **Target reachability** (`target_reachable`) — rejects setups whose 1.5R target sits above the recent N-bar 1H high. **Backtest: avgR +0.148 → +0.182 (+23%) at lookback 160 over 4 OOS symbols.** ON by default (`DAEMON_ENABLE_CEILING=true`, `DAEMON_CEILING_LOOKBACK=160`).
-  - **OTE 62% Fib retrace** (`ote_check`) — rejects long entries above the SMC-orthodox 62% retrace of the impulse leg. **Backtest: regression at every threshold tested (0.50/0.62/0.79).** OFF by default (`DAEMON_ENABLE_OTE=false`); code retained for future re-tuning.
-- 2026-04-30 added whale-on-open-position → agent early-exit review path. WhaleWatchJob enqueues a `position_review` event whenever any whale alert fires on a held symbol; agent decides EARLY_EXIT vs HOLD using the doctrine in Autonomous Agent Mode § "Whale alerts on open positions."
-- 2026-04-30 added **limit-at-sweep** entry pattern. New `trade.py buy-limit` CLI places a LIMIT BUY at the swept swing-low zone (the SMC/Wyckoff "buy the test" entry — anticipate the stop-hunt instead of chasing post-hunt). New daemon `LimitFillMonitorJob` watches intents in `state["limit_intents"]`, auto-attaches OCO on fill, cancels stale orders past expiry. Manual-only for now (no SetupScannerJob auto-placement yet); enabling via `DAEMON_ENABLE_LIMIT_MONITOR=true` after a smoke test will make the daemon manage fills + expiries.
-- 2026-04-30 added **VSA (Volume Spread Analysis)** signature detection in `analysis.vsa_bar` / `vsa_signature`. Detects spring / no_supply / up_thrust / stopping_volume bar patterns. Wired as informational fields (`vsa_ltf` / `vsa_mtf`) into `score_from_dfs` and `confluence_score` so the agent prompt and Discord alerts surface them. **Hard-reject filter (DAEMON_ENABLE_VSA) ships OFF** — backtest regressed ~29% (avgR +0.164 → +0.117) at default thresholds; the up-thrust detector is too noisy and rejects breakouts that follow through. Tuning thresholds (vol_mult, close_pos cutoff, swing_lookback) is a follow-up. Until then, the agent should READ the VSA fields and weight them as judgment input, not as a hard gate.
+- Daemon: Hetzner VPS via Docker. Container limits cpus:8 / mem:4g. Healthy as of 2026-04-30.
 
 ---
 
