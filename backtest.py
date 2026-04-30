@@ -91,6 +91,11 @@ def run_backtest(
     partial_pct: float = 0.0,       # 0 = disabled. Else % of position to close at partial_at_r
     partial_at_r: float = 1.0,
     score_every_n: int = 1,         # only score every Nth bar (4 = once per hour) — big speedup
+    ote_filter: bool = False,       # if True, reject entries above OTE 62% retrace
+    ote_top: float = 0.62,          # retrace threshold (0.62 = SMC-orthodox top of OTE)
+    ceiling_filter: bool = False,   # if True, reject if 1.5R target > recent N-bar MTF high
+    ceiling_lookback: int = 96,     # MTF (1H) bars
+    track_filter_stats: bool = True,
 ) -> dict:
     symbol = symbol.upper()
 
@@ -108,6 +113,7 @@ def run_backtest(
     trades: list[SimTrade] = []
     open_trade: Optional[SimTrade] = None
     open_idx: int = -1
+    filter_stats = {"rejected_ote": 0, "rejected_ceiling": 0}
 
     for i in range(warmup, len(ltf_df) - 1):
         bar = ltf_df.iloc[i]
@@ -228,6 +234,27 @@ def run_backtest(
         if abs(entry - stop) / entry < 0.001:
             continue
 
+        # ── filter: OTE late-entry rejection ──
+        # Always recompute with the requested ote_top — score_from_dfs caches
+        # ote with the default threshold so reusing it would silently ignore
+        # the param. Recompute is cheap (one swings + sweep pass on mtf_slice).
+        if ote_filter:
+            mtf_swings_local = analysis.detect_swings(mtf_slice)
+            mtf_sweep_local = analysis.detect_sweep(mtf_slice, mtf_swings_local)
+            ote = analysis.ote_check(r["direction"], mtf_slice, mtf_swings_local,
+                                     mtf_sweep_local, entry, ote_top=ote_top)
+            if ote.get("valid") is False:
+                filter_stats["rejected_ote"] += 1
+                continue
+
+        # ── filter: target reachability ──
+        if ceiling_filter:
+            tr = analysis.target_reachable(r["direction"], entry, target,
+                                           mtf_slice, lookback=ceiling_lookback)
+            if not tr["reachable"]:
+                filter_stats["rejected_ceiling"] += 1
+                continue
+
         open_trade = SimTrade(
             entry_time=ltf_df.index[i + 1].isoformat(),
             direction=r["direction"],
@@ -281,7 +308,12 @@ def run_backtest(
             "starting_equity": starting_equity,
             "partial_pct": partial_pct,
             "partial_at_r": partial_at_r,
+            "ote_filter": ote_filter,
+            "ote_top": ote_top,
+            "ceiling_filter": ceiling_filter,
+            "ceiling_lookback": ceiling_lookback,
         },
+        "filter_stats": filter_stats,
         "period": {
             "from": ltf_df.index[0].isoformat(),
             "to": ltf_df.index[-1].isoformat(),

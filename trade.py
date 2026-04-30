@@ -863,14 +863,24 @@ def setup_scan(quote, top, min_score, json_out):
 @click.option("--trail-at-r", default=1.0)
 @click.option("--fast/--slow", default=True, help="Use vectorized engine (default: fast)")
 @click.option("--show-trades", is_flag=True, help="Print every simulated trade")
+@click.option("--ote-filter/--no-ote-filter", default=False, help="Reject entries above 62%% Fib retrace (slow only)")
+@click.option("--ote-top", default=0.62, help="OTE retrace threshold (default 0.62)")
+@click.option("--ceiling-filter/--no-ceiling-filter", default=False, help="Reject if 1.5R target above recent MTF high (slow only)")
+@click.option("--ceiling-lookback", default=96, help="MTF (1H) bars for ceiling lookback")
 @click.option("--json", "json_out", is_flag=True)
 def backtest(symbol, bars, min_score, rr, max_hold, risk_pct, equity, partial_pct, partial_at_r,
-             trail_mode, trail_at_r, fast, show_trades, json_out):
+             trail_mode, trail_at_r, fast, show_trades,
+             ote_filter, ote_top, ceiling_filter, ceiling_lookback, json_out):
     """Backtest the confluence strategy on historical data."""
     import backtest as bt
     client = get_client()
+    if (ote_filter or ceiling_filter) and fast:
+        click.echo("⚠ ote/ceiling filters require --slow (not yet wired into fast path). Forcing --slow.")
+        fast = False
     runner = bt.run_backtest_fast if fast else bt.run_backtest
-    extra = {"trail_mode": trail_mode, "trail_at_r": trail_at_r} if fast else {}
+    extra = {"trail_mode": trail_mode, "trail_at_r": trail_at_r} if fast else \
+            {"ote_filter": ote_filter, "ote_top": ote_top,
+             "ceiling_filter": ceiling_filter, "ceiling_lookback": ceiling_lookback}
     result = runner(
         client, symbol.upper(),
         bars_15m=bars, min_score=min_score, rr=rr,

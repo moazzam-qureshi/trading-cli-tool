@@ -317,6 +317,27 @@ The daemon spawns `claude -p` subprocesses to react to live events (score-9 setu
 - Daily budget: max 5 analyses/trades. Hard cap to prevent runaway loops.
 - Tool access for the spawned claude: **Read-only**. Reads pre-rendered chart PNGs and the prompt context. Cannot invoke trade.py buy/sell — those are called by the daemon AFTER validating the verdict.
 
+### Whale alerts on open positions — early-exit doctrine
+
+When a whale alert fires on a symbol where we already hold an open long, the daemon enqueues a `position_review` event. The agent must evaluate whether the whale signal **contradicts** the open trade and decide `EARLY_EXIT` or `SKIP` (= hold).
+
+**Triggers that contradict an open long → strong bias toward `EARLY_EXIT`:**
+- `cvd_strong_distribution` / `cvd_net_distribution` — whales selling spot while we're long. This is the LTC-2026-04-29 pattern: pre-trade CVD distribution caught what numerical score 9 missed. Same logic applies post-entry.
+- `funding_deeply_positive_retail_long` — retail crowded long, whales positioned to fade. We're now part of "retail."
+- `large_net_sell` ≥ $100k/1h — confirmed smart-money distribution in real time.
+
+**Triggers that confirm an open long → `SKIP` (hold):**
+- `funding_deeply_negative` / `funding_lean_negative` — shorts crowded, whales fading them.
+- `oi_dropping_strongly_positions_closing` — short positions capitulating; bullish for our long.
+- `cvd_strong_accumulation` / `cvd_net_accumulation` — whales buying spot.
+- `large_net_buy` ≥ $100k/1h.
+
+**Mixed / ambiguous triggers** (e.g., `oi_spiking_strongly` with no CVD context, or `cvd` + `large` pointing opposite ways): use the chart read to break the tie. If LTF structure has flipped against the trade, lean `EARLY_EXIT`; if structure is intact, `SKIP`.
+
+**Rule of thumb:** the same whale-flow signal that would have rejected the entry pre-trade is sufficient to exit it post-trade. We never hold through a contradiction we wouldn't have entered into.
+
+**Output:** for `EARLY_EXIT`, set `decision: "EARLY_EXIT"`, give reasoning that names the specific whale trigger(s) and the chart evidence, and set entry/stop/target/rr to 0. The daemon will market-sell the remainder via `trade.py sell --yes`.
+
 ---
 
 ## What NOT to Do
@@ -342,6 +363,10 @@ The daemon spawns `claude -p` subprocesses to react to live events (score-9 setu
 - 2026-04-29 toolkit additions: whale-flow module (`whale_flow.py`), whale Discord channel, charting module (`charting.py`) with multi-TF rendering, daemon `WhaleWatchJob`, 3-layer decision filter codified.
 - 2026-04-29 OOS backtest: aggregate +0.19 avgR over 188 trades on MASK/AXS/SUI/APT — system edge confirmed on alts. SUI dropped from universe.
 - Daemon: Hetzner VPS via Docker. Container limits cpus:8 / mem:4g. Healthy as of 2026-04-29.
+- 2026-04-30 added two pro-trader filters in `analysis.py` to address late-entry / fantasy-target failure modes observed live:
+  - **Target reachability** (`target_reachable`) — rejects setups whose 1.5R target sits above the recent N-bar 1H high. **Backtest: avgR +0.148 → +0.182 (+23%) at lookback 160 over 4 OOS symbols.** ON by default (`DAEMON_ENABLE_CEILING=true`, `DAEMON_CEILING_LOOKBACK=160`).
+  - **OTE 62% Fib retrace** (`ote_check`) — rejects long entries above the SMC-orthodox 62% retrace of the impulse leg. **Backtest: regression at every threshold tested (0.50/0.62/0.79).** OFF by default (`DAEMON_ENABLE_OTE=false`); code retained for future re-tuning.
+- 2026-04-30 added whale-on-open-position → agent early-exit review path. WhaleWatchJob enqueues a `position_review` event whenever any whale alert fires on a held symbol; agent decides EARLY_EXIT vs HOLD using the doctrine in Autonomous Agent Mode § "Whale alerts on open positions."
 
 ---
 

@@ -442,6 +442,19 @@ PRIMARY_MIN_SCORE = int(os.getenv("DAEMON_PRIMARY_MIN_SCORE", 9))   # tradeable 
 SECONDARY_MIN_SCORE = int(os.getenv("DAEMON_SECONDARY_MIN_SCORE", 11))
 SECONDARY_REQUIRE_TF_ALIGN = os.getenv("DAEMON_SECONDARY_REQUIRE_TF_ALIGN", "true").lower() == "true"
 
+# Pro-trader filters applied at level-suggestion time. Tunable via env so we can
+# disable in-flight if backtest results disagree.
+#
+# Backtest results (4 OOS symbols, 1500 bars × 15m, score≥9, RR=1.5):
+#   baseline       avgR=+0.148  171 trades  WR=44.4%
+#   ceiling@160    avgR=+0.182  185 trades  WR=46.5%   ← shipped default
+#   OTE@0.62       avgR=+0.122  127 trades  WR=44.9%   ← regression, off by default
+#   OTE+ceiling    avgR=+0.115  130 trades  WR=44.6%   ← OTE dominates and hurts
+OTE_TOP = float(os.getenv("DAEMON_OTE_TOP", 0.62))                  # SMC-orthodox; only used if enabled
+CEILING_LOOKBACK = int(os.getenv("DAEMON_CEILING_LOOKBACK", 160))   # 160 × 1H ≈ 6.7 days
+ENABLE_OTE_FILTER = os.getenv("DAEMON_ENABLE_OTE", "false").lower() == "true"      # off by default
+ENABLE_CEILING_FILTER = os.getenv("DAEMON_ENABLE_CEILING", "true").lower() == "true"
+
 
 def _tf_aligned(r: dict) -> bool:
     """All 3 TFs structurally agree with the trade direction."""
@@ -453,9 +466,17 @@ def _tf_aligned(r: dict) -> bool:
 
 
 def _suggest_levels(client: Client, symbol: str, direction: str, current_price: float) -> Optional[dict]:
-    """Suggest entry/stop/target from current LTF structure. Stop = recent opposing swing."""
+    """Suggest entry/stop/target from current LTF structure. Stop = recent opposing swing.
+
+    Applies pro-trader filters before returning levels:
+      - OTE late-entry rejection (price must have retraced ≥62% of impulse leg)
+      - Target reachability (1.5R target must sit at or below recent MTF high)
+
+    Returns None if any filter rejects — caller treats as "no tradeable setup."
+    """
     try:
         ltf_df = analysis.fetch_klines(client, symbol, "15m", 200)
+        mtf_df = analysis.fetch_klines(client, symbol, "1h", 300)
     except Exception:
         return None
     swings = analysis.detect_swings(ltf_df)
@@ -485,7 +506,29 @@ def _suggest_levels(client: Client, symbol: str, direction: str, current_price: 
 
     if abs(entry - stop) / entry < 0.001:
         return None  # noise stop
-    return {"entry": entry, "stop": stop, "target": target, "rr": TARGET_RR}
+
+    # OTE late-entry filter — uses MTF impulse leg
+    ote = None
+    if ENABLE_OTE_FILTER:
+        mtf_swings = analysis.detect_swings(mtf_df)
+        mtf_sweep = analysis.detect_sweep(mtf_df, mtf_swings)
+        ote = analysis.ote_check(direction, mtf_df, mtf_swings, mtf_sweep, entry,
+                                 ote_top=OTE_TOP)
+        if ote.get("valid") is False:
+            log.info(f"{symbol}: rejected by OTE filter ({ote.get('reason')})")
+            return None
+
+    # Target reachability filter
+    tr = None
+    if ENABLE_CEILING_FILTER:
+        tr = analysis.target_reachable(direction, entry, target, mtf_df,
+                                       lookback=CEILING_LOOKBACK)
+        if not tr["reachable"]:
+            log.info(f"{symbol}: rejected by ceiling filter ({tr.get('reason')})")
+            return None
+
+    return {"entry": entry, "stop": stop, "target": target, "rr": TARGET_RR,
+            "ote": ote, "ceiling": tr}
 
 
 class SetupScannerJob(Job):
@@ -723,18 +766,34 @@ class WhaleWatchJob(Job):
                     alerts_sent += 1
                     for t in fresh:
                         whale_seen[f"{sym}|{t}"] = now
-                    # Hand long-favoring whale events to the agent
-                    if any(("buy" in t) or ("accumulation" in t) or ("deeply_negative" in t) for t in fresh):
-                        try:
-                            current_price = float(client.get_symbol_ticker(symbol=sym)["price"])
-                        except Exception:
-                            current_price = None
+                    try:
+                        current_price = float(client.get_symbol_ticker(symbol=sym)["price"])
+                    except Exception:
+                        current_price = None
+
+                    has_open_position = sym in state.get("positions", {})
+
+                    if has_open_position:
+                        # Whale alert on a symbol we already hold → ask agent to review
+                        # (it may decide EARLY_EXIT if the signal contradicts the trade,
+                        # or HOLD if it confirms / is neutral). Doctrine in CLAUDE.md.
+                        claude_agent.enqueue_event(state, {
+                            "symbol": sym,
+                            "trigger": f"whale_on_open_position_{','.join(fresh)[:80]}",
+                            "type": "position_review",
+                            "current_price": current_price,
+                            "direction": "long",
+                            "whale_triggers": fresh,
+                        })
+                    elif any(("buy" in t) or ("accumulation" in t) or ("deeply_negative" in t) for t in fresh):
+                        # No open position — hand long-favoring whale events to agent for new entry
                         claude_agent.enqueue_event(state, {
                             "symbol": sym,
                             "trigger": f"whale_{','.join(fresh)[:80]}",
                             "type": "whale",
                             "current_price": current_price,
                             "direction": "long",
+                            "whale_triggers": fresh,
                         })
             except Exception as e:
                 log.debug(f"whale_watch {sym}: {e}")

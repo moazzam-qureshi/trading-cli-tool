@@ -164,6 +164,32 @@ def gates_for_buy(verdict: dict, state: dict, client) -> tuple[bool, str]:
     if rr < RR_FLOOR:
         return False, f"R:R {rr:.2f} below floor {RR_FLOOR}"
 
+    # Pro-trader filters: late-entry (OTE) + target reachability.
+    # Defense in depth — _suggest_levels already enforces these for setup_scan,
+    # but whale-watch enqueues bypass that path, so re-check here.
+    # Ceiling filter (target-reachability) is on by default — backtest winner.
+    # OTE filter is off by default — backtest didn't support it.
+    if os.getenv("AGENT_ENABLE_CEILING", "true").lower() == "true" or \
+       os.getenv("AGENT_ENABLE_OTE", "false").lower() == "true":
+        try:
+            import analysis  # local import to avoid hard dep at module load
+            mtf_df = analysis.fetch_klines(client, sym, "1h", 300)
+            if os.getenv("AGENT_ENABLE_OTE", "false").lower() == "true":
+                mtf_swings = analysis.detect_swings(mtf_df)
+                mtf_sweep = analysis.detect_sweep(mtf_df, mtf_swings)
+                ote_top = float(os.getenv("AGENT_OTE_TOP", "0.62"))
+                ote = analysis.ote_check("long", mtf_df, mtf_swings, mtf_sweep, entry, ote_top=ote_top)
+                if ote.get("valid") is False:
+                    return False, f"OTE late-entry: {ote.get('reason')}"
+            if os.getenv("AGENT_ENABLE_CEILING", "true").lower() == "true":
+                lookback = int(os.getenv("AGENT_CEILING_LOOKBACK", "160"))
+                tr = analysis.target_reachable("long", entry, target, mtf_df, lookback=lookback)
+                if not tr["reachable"]:
+                    return False, f"target unreachable: {tr.get('reason')}"
+        except Exception as e:
+            # If filter check itself fails, fail-open (don't block on data fetch failure)
+            log.warning(f"agent filter check failed for {sym}: {e}")
+
     return True, "ok"
 
 
@@ -217,13 +243,17 @@ def build_prompt(event: dict, chart_paths: dict, confluence_text: str) -> str:
     for tf, path in chart_paths.items():
         chart_lines.append(f"  - {tf}: {path}")
 
+    whale_lines = ""
+    if event.get("whale_triggers"):
+        whale_lines = "\n- Whale triggers: " + ", ".join(event["whale_triggers"])
+
     return PROMPT_HEADER + f"""
 
 ## Event
 - Symbol: {symbol}
 - Trigger: {trigger}
 - Current price: ${price}
-- Type: {event.get("type", "setup")}
+- Type: {event.get("type", "setup")}{whale_lines}
 
 ## Layer 1 + Layer 2 (`confluence --whale` already-run output)
 ```

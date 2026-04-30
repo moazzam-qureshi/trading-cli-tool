@@ -290,6 +290,131 @@ def detect_sweep(df: pd.DataFrame, swings: list[Swing], bars: int = 10) -> Optio
 
 
 # ──────────────────────────────────────────────────────────────────
+# OTE (Optimal Trade Entry) — late-entry filter
+# ──────────────────────────────────────────────────────────────────
+# SMC-orthodox check: a trend-continuation entry should sit inside the
+# 62–79% Fib retrace of the most recent impulse leg. If entry is above
+# the 62% retrace (long) it means price hasn't pulled back enough — the
+# trade is "chasing" the move. Reject regardless of confluence score.
+
+def _impulse_leg(direction: str, mtf_df: pd.DataFrame, swings: list[Swing],
+                 sweep: Optional[dict]) -> Optional[tuple[float, float]]:
+    """Return (origin, extreme) for the most recent impulse leg.
+    Long:  origin = sweep dip (or most recent LL/HL/L swing), extreme = highest high since.
+    Short: origin = sweep spike (or most recent HH/LH/H), extreme = lowest low since.
+    """
+    if len(mtf_df) < 5:
+        return None
+
+    if direction == "long":
+        if sweep and sweep.get("type") == "bullish_sweep":
+            origin = float(sweep["dip"])
+            origin_idx = mtf_df["low"].tail(20).idxmin()
+        else:
+            lows = [s for s in swings if s.kind in ("HL", "LL", "L")]
+            if not lows:
+                return None
+            last_low = lows[-1]
+            origin = float(last_low.price)
+            origin_idx = mtf_df.index[last_low.index] if last_low.index < len(mtf_df) else mtf_df.index[-5]
+        post = mtf_df.loc[origin_idx:]
+        if len(post) < 2:
+            return None
+        extreme = float(post["high"].max())
+        if extreme <= origin:
+            return None
+        return (origin, extreme)
+    else:
+        if sweep and sweep.get("type") == "bearish_sweep":
+            origin = float(sweep["spike"])
+            origin_idx = mtf_df["high"].tail(20).idxmax()
+        else:
+            highs = [s for s in swings if s.kind in ("HH", "LH", "H")]
+            if not highs:
+                return None
+            last_high = highs[-1]
+            origin = float(last_high.price)
+            origin_idx = mtf_df.index[last_high.index] if last_high.index < len(mtf_df) else mtf_df.index[-5]
+        post = mtf_df.loc[origin_idx:]
+        if len(post) < 2:
+            return None
+        extreme = float(post["low"].min())
+        if extreme >= origin:
+            return None
+        return (origin, extreme)
+
+
+def ote_check(direction: str, mtf_df: pd.DataFrame, swings: list[Swing],
+              sweep: Optional[dict], current_price: float,
+              ote_top: float = 0.62) -> dict:
+    """Reject if entry is above the OTE top (long) — i.e., price hasn't retraced
+    at least `ote_top` of the impulse leg.
+
+    Returns: {valid: bool, retrace: float, origin: float, extreme: float, reason: str}
+    valid=True means the entry is inside (or below) the OTE zone.
+    """
+    leg = _impulse_leg(direction, mtf_df, swings, sweep)
+    if leg is None:
+        # No impulse identifiable → fail-open (don't block on insufficient data)
+        return {"valid": True, "retrace": None, "reason": "no_impulse_leg"}
+    origin, extreme = leg
+    # retrace = how far back toward origin we've come from extreme. 0 = at extreme, 1 = back at origin.
+    if direction == "long":
+        retrace = (extreme - current_price) / (extreme - origin)
+        ote_top_price = extreme - ote_top * (extreme - origin)
+        valid = current_price <= ote_top_price
+        reason = (f"in_OTE retrace={retrace:.2f}" if valid
+                  else f"extended retrace={retrace:.2f}<{ote_top:.2f}")
+    else:
+        retrace = (current_price - extreme) / (origin - extreme)
+        ote_top_price = extreme + ote_top * (origin - extreme)
+        valid = current_price >= ote_top_price
+        reason = (f"in_OTE retrace={retrace:.2f}" if valid
+                  else f"extended retrace={retrace:.2f}<{ote_top:.2f}")
+    return {"valid": valid, "retrace": round(retrace, 3),
+            "origin": round(origin, 6), "extreme": round(extreme, 6),
+            "ote_top": round(ote_top_price, 6), "reason": reason}
+
+
+# ──────────────────────────────────────────────────────────────────
+# Target reachability — overhead supply / floor demand check
+# ──────────────────────────────────────────────────────────────────
+# Pro target placement: targets sit AT magnets (prior swing highs / supply
+# zones), not floating beyond untested overhead. Reject any setup whose 1.5R
+# target lands above the recent N-bar MTF high.
+
+def target_reachable(direction: str, entry: float, target: float,
+                     mtf_df: pd.DataFrame, lookback: int = 96,
+                     buffer: float = 1.002) -> dict:
+    """For longs: target must sit at-or-below max(MTF high, last `lookback` bars)
+    × buffer. For shorts: target must sit at-or-above min(MTF low) / buffer.
+
+    Returns: {reachable: bool, ceiling: float, headroom_pct: float, reason: str}
+    """
+    if len(mtf_df) < lookback:
+        lookback = len(mtf_df)
+    window = mtf_df.tail(lookback)
+    if direction == "long":
+        ceiling = float(window["high"].max())
+        limit = ceiling * buffer
+        reachable = target <= limit
+        headroom = (ceiling - entry) / entry * 100.0
+        reason = (f"target_below_ceiling ceil={ceiling:.6f}" if reachable
+                  else f"target_{target:.6f}_above_ceil_{ceiling:.6f}")
+        return {"reachable": reachable, "ceiling": round(ceiling, 6),
+                "headroom_pct": round(headroom, 2), "reason": reason}
+    else:
+        floor = float(window["low"].min())
+        limit = floor / buffer
+        reachable = target >= limit
+        headroom = (entry - floor) / entry * 100.0
+        reason = (f"target_above_floor floor={floor:.6f}" if reachable
+                  else f"target_{target:.6f}_below_floor_{floor:.6f}")
+        return {"reachable": reachable, "ceiling": round(floor, 6),
+                "headroom_pct": round(headroom, 2), "reason": reason}
+
+
+# ──────────────────────────────────────────────────────────────────
 # Order Blocks
 # ──────────────────────────────────────────────────────────────────
 
@@ -533,6 +658,11 @@ def score_from_dfs(htf_df: pd.DataFrame, mtf_df: pd.DataFrame, ltf_df: pd.DataFr
             score += 1
             reasons.append(f"RSI healthy short ({rsi_ltf})")
 
+    # OTE + reachability fields (informational; filters applied at trade-open)
+    ote = None
+    if direction:
+        ote = ote_check(direction, mtf_df, mtf["swings"], mtf.get("recent_sweep"),
+                        ltf["current_price"])
     return {
         "direction": direction,
         "score": score,
@@ -543,6 +673,7 @@ def score_from_dfs(htf_df: pd.DataFrame, mtf_df: pd.DataFrame, ltf_df: pd.DataFr
         "current_price": ltf["current_price"],
         "ltf_atr": ltf["indicators"]["atr"],
         "ltf_swings": ltf["swings"],
+        "ote": ote,
     }
 
 
@@ -613,6 +744,16 @@ def confluence_score(client: Client, symbol: str) -> dict:
 
     verdict = "A+ SETUP" if score >= 8 else "Decent" if score >= 5 else "Skip"
 
+    # OTE filter info (informational on alert; enforced at trade open)
+    ote = None
+    if direction:
+        try:
+            mtf_df = fetch_klines(client, symbol, "1h", 300)
+            ote = ote_check(direction, mtf_df, mtf["swings"], mtf.get("recent_sweep"),
+                            ltf["current_price"])
+        except Exception:
+            ote = None
+
     return {
         "symbol": symbol.upper(),
         "direction": direction,
@@ -623,6 +764,7 @@ def confluence_score(client: Client, symbol: str) -> dict:
         "mtf_trend": mtf["structure"]["trend"],
         "ltf_trend": ltf["structure"]["trend"],
         "current_price": ltf["current_price"],
+        "ote": ote,
     }
 
 
