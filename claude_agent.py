@@ -235,6 +235,10 @@ Required JSON schema:
   "primary_concern": "<≤200 chars what could invalidate this>",
   "watch_price_lte": <float|null>,
   "watch_price_gte": <float|null>,
+  "watch_structure_flip": "Bullish" | "Bearish" | null,
+  "watch_cvd_signal": "strong_distribution" | "net_distribution" | "strong_accumulation" | "net_accumulation" | null,
+  "watch_sweep_printed": "bullish" | "bearish" | null,
+  "watch_action": "reeval" | "notify",
   "watch_expires_hours": <float, default 12, max 24>
 }
 
@@ -245,14 +249,35 @@ Decision rules:
 - BUY only if all three layers pass AND R:R ≥ 1.5 AND clean LTF structure.
 - SKIP if the setup is fundamentally broken (wrong direction, distribution, no edge).
 - EARLY_EXIT only used on position-review events where the open trade's setup is invalidated.
-- WATCH when Layers 1-2 are strong but Layer 3 (visual) rejects current entry as a
-  chase / late-rally / round-number trap, AND there is a specific price level that
-  would resolve the visual concern (e.g. pullback into the prior sweep low or 1h
-  EMA support). Set watch_price_lte to that pullback price for longs (or
-  watch_price_gte for breakout-confirmation re-eval). The daemon will re-run a full
-  3-layer eval automatically when price hits that level. Use this INSTEAD of SKIP
-  whenever the setup is "right symbol, wrong price" — exactly the scenario where a
-  pro trader would set a price alert and walk away.
+- WATCH when the situation is "right thesis, wrong moment" — Layers 1-2 strong but
+  Layer 3 visual rejects, OR the setup needs *something to happen* (pullback,
+  structure flip, distribution flush, fresh sweep) before it becomes tradeable.
+  The daemon polls watches and re-runs a fresh 3-layer eval (or just notifies)
+  when ANY condition fires. Use INSTEAD of SKIP whenever a pro trader would
+  set an alert and walk away. Conditions are OR'd — one match triggers.
+
+  **Conditions** (set one or more, leave others null):
+    * `watch_price_lte` — fires when current price ≤ this level. Use for "buy the
+      pullback" — set to the prior sweep low, 1h EMA, or order-block top.
+    * `watch_price_gte` — fires when current price ≥ this. Use for breakout
+      confirmation — set above a key resistance shelf.
+    * `watch_structure_flip` — fires when 1h structure summary becomes Bullish or
+      Bearish. Use when waiting for HTF alignment (e.g. setup is good but 1h is
+      still bearish — set "Bullish" to alert when MTF flips with us).
+    * `watch_cvd_signal` — fires when 4h CVD interpretation hits this. Use for
+      flow-driven re-entry: e.g. setup needs whales to start accumulating
+      ("net_accumulation"), or to wait out distribution ("strong_distribution"
+      → notify so you can re-eval after the flush).
+    * `watch_sweep_printed` — fires when a fresh 15m bullish/bearish sweep
+      prints. Use when waiting for the trigger candle on an otherwise-aligned setup.
+
+  **Action mode:**
+    * `watch_action: "reeval"` (default) — daemon re-runs full 3-layer agent eval
+      when condition fires. Use when you want to actually trade if conditions
+      still hold at trigger time.
+    * `watch_action: "notify"` — daemon posts a Discord ping only, no re-eval.
+      Use for thesis-decay alerts on positions you already hold, or when the
+      condition is just informational and doesn't warrant a fresh agent burn.
 """
 
 
@@ -276,8 +301,8 @@ def build_prompt(event: dict, chart_paths: dict, confluence_text: str) -> str:
             f"\n\n## Re-eval context (this is a previously-set agent watch firing)"
             f"\n- Original thesis (from prior eval): {event.get('original_thesis','')[:500]}"
             f"\n- Original trigger: {event.get('original_trigger','')}"
-            f"\n- Watch fired by: price {event.get('triggered_by','?')} @ ${event.get('triggered_price','?')}"
-            "\n- The previous SKIP/WATCH was based on visual rejection at a different price. Run all 3 layers fresh — the prior thesis is context, not a green light."
+            f"\n- Watch fired by: {event.get('triggered_by','?')} = {event.get('triggered_value','?')} (price now ${event.get('triggered_price','?')})"
+            "\n- The prior thesis is *context*, not a green light. Run all 3 layers fresh — conditions may have decayed since the watch was set. Reject if the setup no longer holds."
         )
 
     return PROMPT_HEADER + f"""
@@ -481,10 +506,17 @@ def post_verdict(verdict: dict, gate_result: tuple[bool, str], action_result: Op
     elif decision == "WATCH":
         cond_parts = []
         if verdict.get("watch_price_lte"):
-            cond_parts.append(f"≤ ${verdict['watch_price_lte']}")
+            cond_parts.append(f"price ≤ ${verdict['watch_price_lte']}")
         if verdict.get("watch_price_gte"):
-            cond_parts.append(f"≥ ${verdict['watch_price_gte']}")
-        fields.append({"name": "Watch trigger", "value": " or ".join(cond_parts) or "?", "inline": True})
+            cond_parts.append(f"price ≥ ${verdict['watch_price_gte']}")
+        if verdict.get("watch_structure_flip"):
+            cond_parts.append(f"1h struct → {verdict['watch_structure_flip']}")
+        if verdict.get("watch_cvd_signal"):
+            cond_parts.append(f"CVD → {verdict['watch_cvd_signal']}")
+        if verdict.get("watch_sweep_printed"):
+            cond_parts.append(f"15m {verdict['watch_sweep_printed']} sweep")
+        fields.append({"name": "Watch trigger (any)", "value": " · ".join(cond_parts) or "?", "inline": False})
+        fields.append({"name": "Action", "value": verdict.get("watch_action", "reeval"), "inline": True})
         fields.append({"name": "Expires", "value": f"{verdict.get('watch_expires_hours', 12)}h", "inline": True})
 
     allowed, gate_msg = gate_result
@@ -695,14 +727,15 @@ class ClaudeAgentJob:
             post_verdict(verdict, (allowed, reason), action_result)
         elif decision == "WATCH":
             sym = verdict.get("symbol", "").upper()
-            price_lte = verdict.get("watch_price_lte")
-            price_gte = verdict.get("watch_price_gte")
-            expires_h = verdict.get("watch_expires_hours") or 12
             ok, reason, watch = agent_watch.add_watch(
                 state, sym,
-                price_lte=float(price_lte) if price_lte else None,
-                price_gte=float(price_gte) if price_gte else None,
-                expires_in_hours=float(expires_h),
+                price_lte=float(verdict["watch_price_lte"]) if verdict.get("watch_price_lte") else None,
+                price_gte=float(verdict["watch_price_gte"]) if verdict.get("watch_price_gte") else None,
+                structure_flip=verdict.get("watch_structure_flip") or None,
+                cvd_signal=verdict.get("watch_cvd_signal") or None,
+                sweep_printed=verdict.get("watch_sweep_printed") or None,
+                action=verdict.get("watch_action") or "reeval",
+                expires_in_hours=float(verdict.get("watch_expires_hours") or 12),
                 thesis=verdict.get("reasoning", "")[:500],
                 original_trigger=(self.current_event or {}).get("trigger", ""),
             )

@@ -312,7 +312,17 @@ The daemon spawns `claude -p` subprocesses to react to live events (score-9 setu
 - Place a `BUY` + OCO order on a symbol that passes all 3 layers (numerical score ≥9, whale-flow not contradicting direction, visual chart read confirms).
 - Issue an early market `SELL` on an open position when its analysis reads the setup as invalidated (e.g., whale flow flips, structure breaks down before stop hit).
 - Re-enter the same symbol once per day after a stop-out, only if a *fresh* score-9 setup forms (not the same setup that just failed).
-- **Set a price WATCH** on a symbol where Layers 1-2 are strong but Layer 3 (visual) rejects the *current* entry as a chase / late-rally / round-number trap, AND there is a specific price level that would resolve the visual concern (e.g. retest of the swept low, or a 1h EMA pullback). Emitted as `decision: "WATCH"` with `watch_price_lte` (long pullback) or `watch_price_gte` (breakout confirmation) and `watch_expires_hours`. The daemon's `AgentWatchJob` polls every 3min and re-runs a fresh full 3-layer eval when price hits the level — the prior thesis is passed in as context, not as a green light. Replaces the SKIP path whenever the situation is "right symbol, wrong price." Caps: 10 active watches, 24h max expiry, 12h default; same-symbol same-direction adds replace the prior watch; triggered watches are one-shot.
+- **Set a conditional WATCH** on a symbol where the situation is "right thesis, wrong moment" — Layers 1-2 strong but the entry needs *something to happen* before it's tradeable. Emitted as `decision: "WATCH"` with one or more conditions (OR-semantics — any match fires):
+  - `watch_price_lte` / `watch_price_gte` — price retest or breakout confirmation
+  - `watch_structure_flip: "Bullish" | "Bearish"` — 1h structure summary becomes target state
+  - `watch_cvd_signal: "strong_distribution" | "net_distribution" | "strong_accumulation" | "net_accumulation"` — 4h CVD interpretation matches
+  - `watch_sweep_printed: "bullish" | "bearish"` — fresh 15m sweep prints
+
+  And an action mode:
+  - `watch_action: "reeval"` (default) — daemon re-runs full 3-layer eval when condition fires; trades if it still passes. Use when waiting to actually take the trade.
+  - `watch_action: "notify"` — daemon posts a Discord ping, no re-eval. Use for thesis-decay alerts on open positions, or informational tracking.
+
+  AgentWatchJob ticks every 3min for price; structure/sweep checks throttle to 10min, CVD to 15min (per-condition env-tunable). Caps: 10 active watches, 24h max expiry, 12h default. Same-symbol overlapping conditions replace the prior watch. Triggered watches are one-shot. The daemon passes the original thesis to the re-eval as *context, not a green light* — conditions may have decayed since the watch was set.
 
 **What the agent CANNOT do:**
 - Modify the OCO stop price (no trailing, BE-move, tightening, widening).

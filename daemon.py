@@ -1134,23 +1134,31 @@ class AgentWatchJob(Job):
 
         for w in triggered:
             sym = w["symbol"]
-            log.info(f"agent_watch: {sym} hit @ ${w['triggered_price']} (set {time.strftime('%H:%M', time.gmtime(w['set_at_ts']))} UTC)")
+            action = w.get("action", "reeval")
+            kind = w["triggered_by"]
+            value = w.get("triggered_value")
+            price = w.get("triggered_price")
+            price_str = f"${price}" if price is not None else "?"
+            log.info(f"agent_watch: {sym} hit ({kind}={value}, action={action}) @ {price_str}")
             try:
+                tail = "Re-evaluating with full 3-layer filter…" if action == "reeval" else "Notify-only — no re-eval."
                 notify.send("signals",
-                            content=f"⏰ Watch triggered — **{sym}** @ ${w['triggered_price']} ({w['triggered_by']} bound). Re-evaluating with full 3-layer filter…")
+                            content=f"⏰ Watch triggered — **{sym}** {kind}={value} (price {price_str}). {tail}")
             except Exception:
                 pass
-            claude_agent.enqueue_event(state, {
-                "symbol": sym,
-                "trigger": f"watch_triggered_{w['triggered_by']}",
-                "type": "watch_triggered",
-                "current_price": w["triggered_price"],
-                "direction": "long",
-                "original_thesis": w.get("thesis", ""),
-                "original_trigger": w.get("original_trigger", ""),
-                "triggered_by": w["triggered_by"],
-                "triggered_price": w["triggered_price"],
-            })
+            if action == "reeval":
+                claude_agent.enqueue_event(state, {
+                    "symbol": sym,
+                    "trigger": f"watch_triggered_{kind}",
+                    "type": "watch_triggered",
+                    "current_price": price,
+                    "direction": "long",
+                    "original_thesis": w.get("thesis", ""),
+                    "original_trigger": w.get("original_trigger", ""),
+                    "triggered_by": kind,
+                    "triggered_value": value,
+                    "triggered_price": price,
+                })
 
         if triggered or agent_watch.list_watches(state):
             save_state(state)
