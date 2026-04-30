@@ -256,8 +256,10 @@ journal.py      — trade journaling (CSV + Discord)
 notify.py       — Discord webhook router (6 channels)
 daemon.py       — long-running daemon (Position, PartialTP, Setup scan, WhaleWatch, AgentWatch, Daily report)
 display.py      — rich terminal output
-risk.py         — daily-loss circuit breaker + position sizing
+risk.py         — daily-loss circuit breaker + ATR-vol sizing + portfolio correlation cap
 agent_watch.py  — agent-set price watches (conditional re-eval when price hits a level)
+macro.py        — Forex Factory feed (FOMC/CPI/PCE/NFP windows); free, no auth
+sessions.py     — thin-vs-prime UTC session quality + min-score bar
 Dockerfile / docker-compose.yml — container deploy
 ```
 
@@ -331,7 +333,19 @@ The daemon spawns `claude -p` subprocesses to react to live events (score-9 setu
 - Place a trade if any pre-execution gate fails (see below).
 - Override the breaker.
 
-**Pre-execution gates (all must pass, checked in `claude_agent.py`):**
+**Pro-trader gates (added April 2026 — all checked in `claude_agent.gates_for_buy` AND `daemon._try_auto_limit_at_sweep`):**
+
+- **Macro window** (`macro.py`, free Forex Factory feed): refuses BUY 60min before / 30min after a USD high-impact event (FOMC, CPI, PCE, NFP, Fed speakers). Cached 6h. Fail-open on feed error. Tunable: `MACRO_WINDOW_BEFORE_MIN`, `MACRO_WINDOW_AFTER_MIN`. CLI: `trade.py macro [--hours 48]`.
+
+- **Session quality** (`sessions.py`): "thin" hours (default 22:00–07:00 UTC) raise the confluence-score bar from 9 → 11. Crypto is 24/7 but post-NY-close LTF setups are materially worse. Soft gate — only blocks lower scores. Tunable: `AGENT_THIN_HOURS_UTC`, `AGENT_THIN_MIN_SCORE`, `AGENT_PRIME_MIN_SCORE`. CLI: `trade.py session`.
+
+- **Volatility-aware sizing** (`risk.vol_sizing_multiplier`): 1h ATR%/price determines a multiplier on base risk%. Normal vol (<4%) = 1.0×; high vol (4–7%) = 0.5× (halved risk); extreme (≥7%) = 0.25× (often blow-off territory). Never scales up. Applied in `execute_buy` before computing position size. Tunable: `ATR_HIGH_VOL_PCT`, `ATR_EXTREME_VOL_PCT`.
+
+- **Portfolio correlation cap** (`risk.concurrent_exposure_check`): refuses BUY if held alt notional + new prospective notional > 50% of account value. Reflects the reality that all alts move with BTC at high R²; three "1% risk" alt longs are ~2.5% effective beta. Fail-open on data error. Tunable: `CONCURRENT_NOTIONAL_CAP_PCT`.
+
+- **Journal awareness**: agent's prompt instructs it to Read `/app/trades.csv` (last 10–15 closed trades) before deciding, surface relevant patterns in `primary_concern`. No data stuffed into the prompt — the agent fetches what it needs.
+
+**Standing pre-execution gates (the original set, also in `claude_agent.py`):**
 1. **Daily breaker**: cumulative realized P&L for current UTC day ≥ -$10. If breached, agent self-pauses until 00:00 UTC next.
 2. **Daily trade cap**: ≤ 5 trades opened today (including re-entries).
 3. **No duplicate position**: agent will not open a second position on a symbol that already has open OCO.

@@ -141,6 +141,41 @@ def balance() -> None:
 
 
 @cli.command()
+@click.option("--hours", type=int, default=48, help="Look-ahead window")
+@click.option("--refresh", is_flag=True, help="Force re-fetch (bypass 6h cache)")
+def macro(hours: int, refresh: bool) -> None:
+    """USD high-impact macro events (Forex Factory free feed)."""
+    import macro as mc
+    if refresh:
+        mc.get_events(force_refresh=True)
+    upcoming = mc.upcoming_high_impact(within_hours=hours)
+    in_win, ev = mc.in_macro_window()
+    out({
+        "now_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds"),
+        "in_macro_window": in_win,
+        "current_event": {"title": ev["title"], "at_utc": ev["_dt_utc"].isoformat()} if ev else None,
+        "window_minutes": {"before": mc.WINDOW_BEFORE_MIN, "after": mc.WINDOW_AFTER_MIN},
+        "upcoming": [{"title": e["title"], "at_utc": e["_dt_utc"].isoformat(),
+                      "impact": e.get("impact"), "forecast": e.get("forecast"), "previous": e.get("previous")}
+                     for e in upcoming],
+    })
+
+
+@cli.command()
+def session() -> None:
+    """Current trading-session quality (prime / thin) + min-score required."""
+    import sessions as ss
+    out({
+        "quality": ss.current_quality(),
+        "required_min_score": ss.required_min_score(),
+        "prime_min_score": ss.PRIME_MIN_SCORE,
+        "thin_min_score": ss.THIN_MIN_SCORE,
+        "thin_hours_utc": ss.THIN_HOURS_RAW,
+        "next_prime_window_start_utc": ss.next_prime_window_start().isoformat(),
+    })
+
+
+@cli.command()
 @click.argument("symbol")
 def price(symbol: str) -> None:
     """Current ticker price."""

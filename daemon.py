@@ -681,6 +681,35 @@ def _try_auto_limit_at_sweep(client: Client, state: dict, r: dict) -> tuple[bool
     if agent_daily.get("trades_opened", 0) >= claude_agent.DAILY_TRADE_CAP:
         return False, f"agent daily trade cap hit ({agent_daily['trades_opened']}/{claude_agent.DAILY_TRADE_CAP})"
 
+    # Pro-trader gates — same set as claude_agent.gates_for_buy
+    try:
+        import macro
+        in_win, ev = macro.in_macro_window()
+        if in_win and ev:
+            return False, f"macro window: {ev.get('title','?')} (±{macro.WINDOW_BEFORE_MIN}/{macro.WINDOW_AFTER_MIN}min)"
+    except Exception as e:
+        log.warning(f"auto-limit macro check failed: {e}")
+    try:
+        import sessions
+        if sessions.current_quality() == "thin":
+            score = int(r.get("score", 0) or 0)
+            need = sessions.required_min_score()
+            if score < need:
+                return False, f"thin session — score {score} < required {need}"
+    except Exception as e:
+        log.warning(f"auto-limit session check failed: {e}")
+    try:
+        import risk as risk_mod
+        free, held = claude_agent._account_components(client)
+        account_value = free + held
+        ok, info = risk_mod.concurrent_exposure_check(
+            client, account_value=account_value, prospective_notional=AUTO_LIMIT_USDT_PER_TRADE)
+        if not ok:
+            return False, (f"correlation cap: held ${info['current_held_usdt']} + new "
+                           f"${info['prospective_notional']} > {info['cap_pct']}% of ${info['account_value']}")
+    except Exception as e:
+        log.warning(f"auto-limit correlation check failed: {e}")
+
     pending = state.setdefault("limit_intents", {})
     if len(pending) >= AUTO_LIMIT_MAX_PENDING:
         return False, f"max pending limits reached ({len(pending)}/{AUTO_LIMIT_MAX_PENDING})"

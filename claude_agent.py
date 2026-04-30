@@ -202,7 +202,72 @@ def gates_for_buy(verdict: dict, state: dict, client) -> tuple[bool, str]:
             # If filter check itself fails, fail-open (don't block on data fetch failure)
             log.warning(f"agent filter check failed for {sym}: {e}")
 
+    # ── Macro window gate ──────────────────────────────────────────
+    try:
+        import macro
+        in_win, ev = macro.in_macro_window()
+        if in_win and ev:
+            ev_dt = ev["_dt_utc"].strftime("%H:%M UTC")
+            return False, f"macro window: {ev.get('title','?')} @ {ev_dt} (±{macro.WINDOW_BEFORE_MIN}/{macro.WINDOW_AFTER_MIN}min)"
+    except Exception as e:
+        log.warning(f"macro window check failed: {e}")  # fail-open
+
+    # ── Session-quality gate (soft: raise score bar in thin hours) ──
+    try:
+        import sessions
+        quality = sessions.current_quality()
+        if quality == "thin":
+            need = sessions.required_min_score()
+            score = int(verdict.get("score", 0) or 0)
+            if score < need:
+                return False, f"thin session — score {score} < required {need} during {quality} hours"
+    except Exception as e:
+        log.warning(f"session check failed: {e}")  # fail-open
+
+    # ── Portfolio correlation cap ──────────────────────────────────
+    try:
+        import risk
+        free, held = _account_components(client)
+        account_value = free + held
+        # Rough prospective notional: agent sizes at 1% risk; trade notional ≈ risk_usd × entry/(entry-stop).
+        risk_usd = account_value * 0.01
+        per_unit_risk = max(entry - stop, entry * 0.001)
+        prospective = (risk_usd / per_unit_risk) * entry if per_unit_risk > 0 else 30.0
+        prospective = max(10.0, min(prospective, account_value))
+        ok, info = risk.concurrent_exposure_check(client, account_value=account_value, prospective_notional=prospective)
+        if not ok:
+            return False, (f"correlation cap: held ${info['current_held_usdt']} + new "
+                           f"${info['prospective_notional']} > {info['cap_pct']}% of ${info['account_value']}")
+    except Exception as e:
+        log.warning(f"correlation check failed: {e}")  # fail-open
+
     return True, "ok"
+
+
+def _account_components(client) -> tuple[float, float]:
+    """Returns (free_usdt, held_usdt_equiv). Used for account_value = sum."""
+    try:
+        acc = client.get_account()
+        free = 0.0
+        held = 0.0
+        for b in acc["balances"]:
+            asset = b["asset"]
+            qty = float(b["free"]) + float(b["locked"])
+            if qty <= 0:
+                continue
+            if asset == "USDT":
+                free = float(b["free"])
+                continue
+            if asset in ("BUSD", "USDC", "FDUSD"):
+                continue
+            try:
+                px = float(client.get_symbol_ticker(symbol=f"{asset}USDT")["price"])
+                held += qty * px
+            except Exception:
+                continue
+        return free, held
+    except Exception:
+        return 0.0, 0.0
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -318,6 +383,11 @@ def build_prompt(event: dict, chart_paths: dict, confluence_text: str) -> str:
 {confluence_text}
 ```
 
+## Recent trade history (use the Read tool to consult before deciding)
+- Journal CSV: `/app/trades.csv` — read the LAST 10-15 closed trades. Look for patterns: which setups are losing? counter-MTF? specific symbols? thin-session entries? Note any 3-in-a-row losses on a setup type — if so, raise the bar on similar setups today.
+- Quick stats: `journal stats` (already in pipeline output above when relevant).
+- This is your post-mortem feedback loop — pro traders read their own journal before each entry. Skim it briefly; do not stuff it into your reasoning. If you see a relevant lesson, mention it in `primary_concern`.
+
 ## Layer 3 — chart PNGs to read with the Read tool
 
 You MUST read each of these 5 charts before deciding. They live in `/app/charts/` inside this container:
@@ -420,9 +490,22 @@ def execute_buy(verdict: dict, client, state: dict) -> tuple[bool, str]:
     target = float(verdict["target"])
 
     free = _free_usdt(client)
-    risk_usd = free * RISK_PCT_PER_TRADE / 100.0
+
+    # ── ATR-aware sizing: scale risk% down in choppy/blow-off vol regimes ──
+    try:
+        import risk as risk_mod
+        vol_mult, vol_info = risk_mod.vol_sizing_multiplier(client, sym)
+    except Exception as e:
+        log.warning(f"agent: vol-sizing lookup failed for {sym}: {e}")
+        vol_mult, vol_info = 1.0, {"error": str(e)[:80]}
+
+    effective_risk_pct = RISK_PCT_PER_TRADE * vol_mult
+    risk_usd = free * effective_risk_pct / 100.0
+    if vol_mult < 1.0:
+        log.info(f"agent: vol-sizing {sym} mult={vol_mult} regime={vol_info.get('regime')} "
+                 f"atr%={vol_info.get('atr_pct_of_price')} → risk%={effective_risk_pct}")
     if risk_usd <= 0.5:
-        return False, f"risk_usd ${risk_usd:.2f} too small (free USDT ${free:.2f})"
+        return False, f"risk_usd ${risk_usd:.2f} too small (free USDT ${free:.2f}, vol_mult={vol_mult})"
 
     # USD to buy = risk_usd / (stop_distance%)
     stop_dist_pct = (entry - stop) / entry

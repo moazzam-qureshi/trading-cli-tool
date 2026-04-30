@@ -16,7 +16,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy app code
-COPY analysis.py agent_watch.py backtest.py charting.py claude_agent.py daemon.py display.py journal.py notify.py risk.py trade.py whale_flow.py ./
+COPY analysis.py agent_watch.py backtest.py charting.py claude_agent.py daemon.py display.py journal.py macro.py notify.py risk.py sessions.py trade.py whale_flow.py ./
 
 # Persistent dirs (mounted as volumes at runtime). /home/trader/.claude holds the
 # claude-code login token — backed by a named volume so it survives rebuilds.
