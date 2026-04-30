@@ -429,6 +429,160 @@ class PartialTPJob(Job):
 
 
 # ──────────────────────────────────────────────────────────────────
+# LimitFillMonitorJob — watches limit-at-sweep intents
+# ──────────────────────────────────────────────────────────────────
+# Wakes up frequently, reads state["limit_intents"] keyed by orderId.
+# For each intent:
+#   - FILLED  → place_oco_sell with persisted stop/target, journal the
+#               trade, post Discord trade_opened, drop the intent.
+#   - NEW + past expiry → cancel order via Binance, post limit_expired,
+#               drop the intent.
+#   - CANCELED / EXPIRED / REJECTED  → drop the intent (cleanup).
+#   - any error → log and leave intent in place; retry next interval.
+#
+# Disabled by default. Flip on via env DAEMON_ENABLE_LIMIT_MONITOR=true
+# only after a manual buy-limit smoke test confirms intents persist and
+# OCO attaches as expected.
+
+class LimitFillMonitorJob(Job):
+    name = "limit_fill_monitor"
+
+    def __init__(self):
+        super().__init__()
+        self.interval = int(os.getenv("DAEMON_LIMIT_MONITOR_INTERVAL", 30))
+        self.enabled = os.getenv("DAEMON_ENABLE_LIMIT_MONITOR", "false").lower() == "true"
+
+    def run(self, ctx: dict) -> None:
+        if not self.enabled:
+            return
+        client: Client = ctx["client"]
+        state: dict = ctx["state"]
+        intents: dict = state.setdefault("limit_intents", {})
+        if not intents:
+            return
+
+        from decimal import Decimal as D
+        import journal as jrnl
+        import trade as trade_mod  # for place_oco_sell / round_step / fmt
+
+        now = time.time()
+        for order_id in list(intents.keys()):
+            intent = intents[order_id]
+            sym = intent["symbol"]
+            try:
+                order = client.get_order(symbol=sym, orderId=int(order_id))
+            except Exception as e:
+                log.warning(f"limit_monitor: get_order {sym}/{order_id} failed: {e}")
+                continue
+
+            status = order["status"]
+
+            if status == "FILLED":
+                self._on_fill(client, state, intent, order)
+                intents.pop(order_id, None)
+                save_state(state)
+                continue
+
+            if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                log.info(f"limit_monitor: {sym} order {order_id} {status} — dropping intent")
+                intents.pop(order_id, None)
+                save_state(state)
+                continue
+
+            # status == NEW or PARTIALLY_FILLED — check expiry
+            if status == "NEW" and now >= intent.get("expiry_ts", 0):
+                try:
+                    client.cancel_order(symbol=sym, orderId=int(order_id))
+                    log.info(f"limit_monitor: {sym} order {order_id} expired — cancelled")
+                    notify.send("signals",
+                                content=f"⏰ LIMIT expired **{sym}** — cancelled unfilled @ ${intent['limit_price']} "
+                                        f"after {(now - intent.get('opened_at', now)) / 3600:.1f}h. No trade taken.")
+                    intents.pop(order_id, None)
+                    save_state(state)
+                except Exception as e:
+                    log.warning(f"limit_monitor: cancel {sym}/{order_id} failed: {e}")
+                continue
+            # PARTIALLY_FILLED: leave it; revisit next tick. (rare on small accounts)
+
+    def _on_fill(self, client: Client, state: dict, intent: dict, order: dict) -> None:
+        sym = intent["symbol"]
+        # use exact filled amount (rounded down to lot step) — not the original qty,
+        # because Binance fees are taken from base asset on a BUY
+        try:
+            base_asset = sym.replace("USDT", "").replace("BUSD", "")
+            free_base = float(client.get_asset_balance(asset=base_asset)["free"])
+        except Exception as e:
+            log.error(f"limit_monitor: balance fetch failed for {sym}: {e}")
+            return
+
+        from decimal import Decimal as D
+        import trade as trade_mod
+        lot = D(intent["lot_step"])
+        tick = D(intent["tick_step"])
+        qty_d = trade_mod.round_step(D(str(free_base)), lot)
+        if qty_d <= 0:
+            log.error(f"limit_monitor: filled but free balance ≤ 0 for {sym}")
+            return
+
+        stop_d = trade_mod.round_step(D(str(intent["stop"])), tick)
+        target_d = trade_mod.round_step(D(str(intent["target"])), tick)
+        stop_limit_d = trade_mod.round_step(D(str(intent["stop_limit"])), tick)
+
+        try:
+            oco = trade_mod.place_oco_sell(
+                client, symbol=sym,
+                quantity=trade_mod.fmt(qty_d, lot),
+                target=trade_mod.fmt(target_d, tick),
+                stop=trade_mod.fmt(stop_d, tick),
+                stop_limit=trade_mod.fmt(stop_limit_d, tick),
+            )
+            log.info(f"limit_monitor: OCO attached for {sym} (orderListId={oco.get('orderListId')})")
+        except Exception as e:
+            log.error(f"limit_monitor: OCO place FAILED for {sym}: {e}")
+            notify.send("signals",
+                        content=f"⚠️ **{sym}** LIMIT filled but OCO failed: {e}. "
+                                f"Run `trade.py protect {sym} --stop {intent['stop']} --target {intent['target']}` ASAP.")
+            return
+
+        # Compute average fill price for journal
+        try:
+            avg_fill = float(D(order["cummulativeQuoteQty"]) / D(order["executedQty"]))
+        except Exception:
+            avg_fill = float(intent["limit_price"])
+
+        # Journal
+        try:
+            risk_usdt = abs(avg_fill - float(intent["stop"])) * float(qty_d)
+            reward_usdt = abs(float(intent["target"]) - avg_fill) * float(qty_d)
+            tid = jrnl.log_entry({
+                "symbol": sym, "side": "BUY",
+                "entry_price": avg_fill, "quantity": float(qty_d),
+                "stop_loss": float(intent["stop"]), "take_profit": float(intent["target"]),
+                "risk_usdt": round(risk_usdt, 4), "reward_usdt": round(reward_usdt, 4),
+                "rr_ratio": round(reward_usdt / risk_usdt, 2) if risk_usdt else None,
+                "setup_type": intent.get("setup", "limit_at_sweep"),
+                "confluence_score": "",
+                "reasoning": intent.get("reason", "limit-at-sweep entry — filled by daemon"),
+                "buy_order_id": str(order.get("orderId", "")),
+                "oco_list_id": str(oco.get("orderListId", "")),
+            })
+            log.info(f"limit_monitor: journaled {sym} as {tid}")
+        except Exception as e:
+            log.warning(f"limit_monitor: journal failed for {sym}: {e}")
+
+        # Discord
+        try:
+            notify.trade_opened(
+                symbol=sym, side="LONG", qty=float(qty_d),
+                entry=avg_fill, stop=float(intent["stop"]), target=float(intent["target"]),
+                risk=float(qty_d) * (avg_fill - float(intent["stop"])),
+                reward=float(qty_d) * (float(intent["target"]) - avg_fill),
+            )
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────
 # SetupScannerJob — periodic A+ setup scans
 # ──────────────────────────────────────────────────────────────────
 
@@ -860,6 +1014,7 @@ def main() -> None:
         StartupJob(),
         PositionMonitorJob(),
         PartialTPJob(),
+        LimitFillMonitorJob(),
         SetupScannerJob(),
         WhaleWatchJob(),
         DailyReportJob(),

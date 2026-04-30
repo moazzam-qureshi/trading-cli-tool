@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import time
 from decimal import Decimal, ROUND_DOWN
 
 # Force UTF-8 on Windows so rich/unicode output works without env vars
@@ -359,6 +360,138 @@ def buy(symbol, usd, quantity, entry, stop, target, slip, yes, override_breaker,
         result["note"] = "Limit order placed but not yet filled. Run `trade.py protect SYMBOL --stop X --target Y` after fill."
 
     out(result)
+
+
+# ──────────────────────────────────────────────────────────────────
+# buy-limit — limit-at-sweep entry: place LIMIT BUY at a chosen level
+# (typically just above a recent swing-low / liquidity-sweep zone) and
+# persist the intent. Daemon's LimitFillMonitorJob auto-attaches OCO
+# on fill and cancels stale orders past expiry.
+# ──────────────────────────────────────────────────────────────────
+
+def _save_limit_intent(intent: dict) -> None:
+    state = _load_state()
+    intents = state.setdefault("limit_intents", {})
+    intents[str(intent["order_id"])] = intent
+    _save_state(state)
+
+
+@cli.command(name="buy-limit")
+@click.argument("symbol")
+@click.option("--usd", type=float, required=True, help="USDT amount to spend at fill")
+@click.option("--limit", "limit_price", type=float, required=True, help="LIMIT BUY price (e.g. just above swept swing low)")
+@click.option("--stop", type=float, required=True, help="Stop-loss for the OCO that attaches on fill")
+@click.option("--target", type=float, required=True, help="Take-profit for the OCO")
+@click.option("--slip", type=float, default=0.5, help="Stop-limit slippage %% below stop (default 0.5)")
+@click.option("--expiry-hours", type=float, default=4.0, help="Cancel the limit if unfilled after this many hours (default 4)")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+@click.option("--reason", default="", help="Reasoning for the trade")
+@click.option("--setup", default="", help="Setup label (e.g. 'sweep+OB')")
+def buy_limit(symbol, usd, limit_price, stop, target, slip, expiry_hours, yes, reason, setup):
+    """Place a LIMIT BUY at a chosen entry price (limit-at-sweep). Daemon attaches OCO on fill."""
+    client = get_client()
+    symbol = symbol.upper()
+    filters = get_filters(client, symbol)
+
+    # Circuit-breaker check (same as market buy)
+    acc = client.get_account()
+    free_usdt = float(next((b for b in acc["balances"] if b["asset"] == "USDT"), {"free": "0"})["free"])
+    breaker = risk.check_trading_allowed(account_value=max(free_usdt, 1.0))
+    if not breaker["allowed"]:
+        out({"error": "Trading paused by circuit breaker", **breaker})
+        sys.exit(2)
+
+    lot = Decimal(filters["LOT_SIZE"]["stepSize"])
+    tick = Decimal(filters["PRICE_FILTER"]["tickSize"])
+    min_notional = Decimal(filters.get("NOTIONAL", filters.get("MIN_NOTIONAL", {"minNotional": "5"}))["minNotional"])
+
+    current = Decimal(client.get_symbol_ticker(symbol=symbol)["price"])
+    limit_d = round_step(Decimal(str(limit_price)), tick)
+    stop_d = round_step(Decimal(str(stop)), tick)
+    target_d = round_step(Decimal(str(target)), tick)
+    stop_limit_d = round_step(stop_d * (Decimal("1") - Decimal(str(slip)) / Decimal("100")), tick)
+
+    qty = round_step(Decimal(str(usd)) / limit_d, lot)
+    if qty * limit_d < min_notional:
+        raise click.ClickException(f"Order too small. Min notional ${min_notional}")
+
+    # Sanity guards specific to limit-at-sweep:
+    # 1. limit must be BELOW current (we want to BUY THE DIP, not chase)
+    # 2. stop must be below limit, target above limit
+    cur_f = float(current); lim_f = float(limit_d); stop_f = float(stop_d); tgt_f = float(target_d)
+    if lim_f >= cur_f:
+        raise click.ClickException(
+            f"Refusing buy-limit: limit {limit_d} ≥ current {current}. "
+            f"For a limit-at-sweep entry the limit must sit BELOW current price (we wait for a dip)."
+        )
+    if stop_f >= lim_f:
+        raise click.ClickException(f"Refusing: stop {stop_d} ≥ limit {limit_d}. Stop must be below entry.")
+    if tgt_f <= lim_f:
+        raise click.ClickException(f"Refusing: target {target_d} ≤ limit {limit_d}. Target must be above entry.")
+    # Reject obvious magnitude typos (>50% from current)
+    if (cur_f - lim_f) / cur_f > 0.50:
+        raise click.ClickException(f"Refusing: limit is {(cur_f-lim_f)/cur_f*100:.1f}% below current — almost certainly a typo.")
+    # R:R floor (same as agent floor — 1.5)
+    rr = (tgt_f - lim_f) / (lim_f - stop_f)
+    if rr < 1.5:
+        raise click.ClickException(f"Refusing: R:R {rr:.2f} below 1.5 floor.")
+
+    plan = {
+        "symbol": symbol, "side": "BUY", "type": "LIMIT",
+        "current_price": fmt(current, tick),
+        "limit_entry": fmt(limit_d, tick),
+        "dip_pct": f"{(cur_f - lim_f) / cur_f * 100:.2f}%",
+        "quantity": fmt(qty, lot),
+        "estimated_cost_usdt": fmt(qty * limit_d, tick),
+        "stop_loss": fmt(stop_d, tick),
+        "stop_limit": fmt(stop_limit_d, tick),
+        "take_profit": fmt(target_d, tick),
+        "rr": round(rr, 2),
+        "expiry_hours": expiry_hours,
+        "risk_usdt": fmt(qty * (limit_d - stop_d), tick),
+        "reward_usdt": fmt(qty * (target_d - limit_d), tick),
+    }
+    if not yes:
+        click.echo(json.dumps(plan, indent=2))
+        if not click.confirm("Place this limit-at-sweep order?"):
+            click.echo(json.dumps({"cancelled": True}))
+            return
+
+    buy_order = client.order_limit_buy(
+        symbol=symbol, quantity=fmt(qty, lot), price=fmt(limit_d, tick),
+    )
+    order_id = str(buy_order["orderId"])
+
+    # Persist intent so the daemon's LimitFillMonitorJob can attach OCO on fill / cancel on expiry
+    now_ts = int(time.time())
+    intent = {
+        "order_id": order_id,
+        "symbol": symbol,
+        "limit_price": float(limit_d),
+        "quantity": float(qty),
+        "stop": float(stop_d),
+        "target": float(target_d),
+        "stop_limit": float(stop_limit_d),
+        "expiry_ts": now_ts + int(expiry_hours * 3600),
+        "opened_at": now_ts,
+        "reason": reason,
+        "setup": setup,
+        "lot_step": str(lot),
+        "tick_step": str(tick),
+    }
+    _save_limit_intent(intent)
+
+    # Discord notify (signals channel)
+    try:
+        notify.send("signals",
+                    content=(f"🎯 LIMIT placed **{symbol}** — buy @ ${limit_d} "
+                             f"(dip {(cur_f - lim_f) / cur_f * 100:.2f}% from ${current}); "
+                             f"OCO on fill: stop ${stop_d} / tp ${target_d} (R:R {rr:.2f}). "
+                             f"Expires in {expiry_hours}h."))
+    except Exception:
+        pass
+
+    out({"buy_limit": buy_order, "intent_saved": intent, "plan": plan})
 
 
 @cli.command()

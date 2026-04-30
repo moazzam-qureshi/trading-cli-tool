@@ -199,11 +199,14 @@ trade.py chart-multi SYMBOL             # 1d/4h/1h/15m/5m bundle
 ### Risk + execution
 ```bash
 trade.py size --risk N --entry X --stop Y --target Z
-trade.py buy SYMBOL --usd N --stop X --target Y    # MARKET buy + auto OCO + auto-journal
-trade.py protect SYMBOL --stop X --target Y        # attach OCO to existing position
-trade.py sell SYMBOL --yes                         # emergency exit
+trade.py buy SYMBOL --usd N --stop X --target Y                    # MARKET buy + auto OCO + auto-journal
+trade.py buy-limit SYMBOL --usd N --limit X --stop Y --target Z    # LIMIT BUY at sweep zone; daemon auto-OCO on fill
+trade.py protect SYMBOL --stop X --target Y                        # attach OCO to existing position
+trade.py sell SYMBOL --yes                                         # emergency exit
 trade.py orders [--symbol X] | cancel SYMBOL ID
 ```
+
+**`buy-limit` semantics — the "buy the test" entry:** instead of MARKET-buying after a setup fires, place a LIMIT BUY just above the recent liquidity sweep low (where retail stops cluster). Wait for price to retest. If it fills, daemon's `LimitFillMonitorJob` auto-attaches OCO. If it doesn't fill within `--expiry-hours` (default 4), the daemon cancels the order and no trade is taken — built-in "no chase." Requires `DAEMON_ENABLE_LIMIT_MONITOR=true` for the auto-attach to work; default is OFF until a manual smoke test confirms intents persist correctly.
 
 ### Journal
 ```bash
@@ -367,6 +370,7 @@ When a whale alert fires on a symbol where we already hold an open long, the dae
   - **Target reachability** (`target_reachable`) — rejects setups whose 1.5R target sits above the recent N-bar 1H high. **Backtest: avgR +0.148 → +0.182 (+23%) at lookback 160 over 4 OOS symbols.** ON by default (`DAEMON_ENABLE_CEILING=true`, `DAEMON_CEILING_LOOKBACK=160`).
   - **OTE 62% Fib retrace** (`ote_check`) — rejects long entries above the SMC-orthodox 62% retrace of the impulse leg. **Backtest: regression at every threshold tested (0.50/0.62/0.79).** OFF by default (`DAEMON_ENABLE_OTE=false`); code retained for future re-tuning.
 - 2026-04-30 added whale-on-open-position → agent early-exit review path. WhaleWatchJob enqueues a `position_review` event whenever any whale alert fires on a held symbol; agent decides EARLY_EXIT vs HOLD using the doctrine in Autonomous Agent Mode § "Whale alerts on open positions."
+- 2026-04-30 added **limit-at-sweep** entry pattern. New `trade.py buy-limit` CLI places a LIMIT BUY at the swept swing-low zone (the SMC/Wyckoff "buy the test" entry — anticipate the stop-hunt instead of chasing post-hunt). New daemon `LimitFillMonitorJob` watches intents in `state["limit_intents"]`, auto-attaches OCO on fill, cancels stale orders past expiry. Manual-only for now (no SetupScannerJob auto-placement yet); enabling via `DAEMON_ENABLE_LIMIT_MONITOR=true` after a smoke test will make the daemon manage fills + expiries.
 
 ---
 
