@@ -415,6 +415,119 @@ def target_reachable(direction: str, entry: float, target: float,
 
 
 # ──────────────────────────────────────────────────────────────────
+# Volume Spread Analysis (VSA / Tom Williams / Wyckoff)
+# ──────────────────────────────────────────────────────────────────
+# Price alone can be faked by smart money pushing thin orderbooks; the
+# VOLUME signature is much harder to disguise because real positioning
+# requires real paper changing hands. These four patterns flag whether
+# what we're seeing is real demand/supply or a trap.
+#
+#   spring          — broke recent low + closed back above + LOW volume
+#                     = stop-hunt with no real selling pressure (bullish)
+#   no_supply       — down bar on shrinking volume
+#                     = no sellers showing up; pullback has no force (bullish)
+#   up_thrust       — new high + close in lower half + HIGH volume
+#                     = breakout trap, smart money sold into it (BEARISH — hard reject longs)
+#   stopping_volume — down bar w/ high volume but close in upper half / narrow range
+#                     = absorption, big buyer eating the supply (bullish)
+
+def vsa_bar(df: pd.DataFrame, i: int, vol_avg_period: int = 20,
+            high_vol_mult: float = 1.5, low_vol_mult: float = 0.7,
+            extreme_vol_mult: float = 1.8, swing_lookback: int = 10) -> str:
+    """Classify bar at positional index i. Returns one of:
+    'spring' | 'no_supply' | 'up_thrust' | 'stopping_volume' | 'none'.
+    """
+    if i < 1 or i >= len(df):
+        return "none"
+    bar = df.iloc[i]
+    high = float(bar["high"]); low = float(bar["low"])
+    open_ = float(bar["open"]); close = float(bar["close"])
+    vol = float(bar["volume"])
+    rng = high - low
+    if rng <= 0:
+        return "none"
+    body = close - open_
+    close_pos = (close - low) / rng  # 0 = closed at low, 1 = closed at high
+
+    start = max(0, i - vol_avg_period)
+    vol_window = df["volume"].iloc[start:i]
+    if len(vol_window) < 5:
+        return "none"
+    vol_avg = float(vol_window.mean())
+    if vol_avg <= 0:
+        return "none"
+    vol_ratio = vol / vol_avg
+
+    sw_start = max(0, i - swing_lookback)
+    prior_highs = df["high"].iloc[sw_start:i]
+    prior_lows = df["low"].iloc[sw_start:i]
+    if len(prior_highs) < 3:
+        return "none"
+    prior_high_max = float(prior_highs.max())
+    prior_low_min = float(prior_lows.min())
+
+    # Up-thrust: took out recent high, closed in lower half, with high volume.
+    # The up wick + weak close + heavy volume is the smart-money distribution
+    # signature. Check this FIRST so it overrides anything else.
+    if high > prior_high_max and close_pos < 0.5 and vol_ratio > 1.3:
+        return "up_thrust"
+
+    # Spring: took out recent low, closed back above it, on LOW volume.
+    if low < prior_low_min and close > prior_low_min and vol_ratio < low_vol_mult:
+        return "spring"
+
+    # Stopping volume: down bar, high volume, but close in upper half (absorption).
+    if body < 0 and vol_ratio > extreme_vol_mult and close_pos > 0.5:
+        return "stopping_volume"
+
+    # No-supply: down bar on shrinking volume.
+    if body < 0 and vol_ratio < 0.6:
+        return "no_supply"
+
+    return "none"
+
+
+def vsa_signature(df: pd.DataFrame, lookback: int = 5) -> dict:
+    """Return VSA reads for the most recent `lookback` bars on this dataframe.
+
+    Output:
+        {
+          "latest_bar": "spring" | "up_thrust" | ... | "none",
+          "recent_signals": [{"offset": int (0=newest), "signal": str}, ...],
+          "has_up_thrust": bool,        # any of the recent bars
+          "has_spring": bool,
+          "has_no_supply": bool,
+          "has_stopping_volume": bool,
+        }
+    """
+    n = len(df)
+    if n < 25:
+        return {"latest_bar": "none", "recent_signals": [],
+                "has_up_thrust": False, "has_spring": False,
+                "has_no_supply": False, "has_stopping_volume": False}
+
+    last_sig = vsa_bar(df, n - 1)
+    recent: list[dict] = []
+    for k in range(lookback):
+        idx = n - 1 - k
+        if idx < 1:
+            break
+        s = vsa_bar(df, idx)
+        if s != "none":
+            recent.append({"offset": k, "signal": s})
+
+    sigs = {r["signal"] for r in recent}
+    return {
+        "latest_bar": last_sig,
+        "recent_signals": recent,
+        "has_up_thrust": "up_thrust" in sigs,
+        "has_spring": "spring" in sigs,
+        "has_no_supply": "no_supply" in sigs,
+        "has_stopping_volume": "stopping_volume" in sigs,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────
 # Order Blocks
 # ──────────────────────────────────────────────────────────────────
 
@@ -663,6 +776,11 @@ def score_from_dfs(htf_df: pd.DataFrame, mtf_df: pd.DataFrame, ltf_df: pd.DataFr
     if direction:
         ote = ote_check(direction, mtf_df, mtf["swings"], mtf.get("recent_sweep"),
                         ltf["current_price"])
+
+    # VSA signature on LTF (entry timeframe) and MTF (context timeframe)
+    vsa_ltf = vsa_signature(ltf_df, lookback=3)   # 3 most recent 15m bars
+    vsa_mtf = vsa_signature(mtf_df, lookback=5)   # 5 most recent 1h bars
+
     return {
         "direction": direction,
         "score": score,
@@ -674,6 +792,8 @@ def score_from_dfs(htf_df: pd.DataFrame, mtf_df: pd.DataFrame, ltf_df: pd.DataFr
         "ltf_atr": ltf["indicators"]["atr"],
         "ltf_swings": ltf["swings"],
         "ote": ote,
+        "vsa_ltf": vsa_ltf,
+        "vsa_mtf": vsa_mtf,
     }
 
 
@@ -744,15 +864,20 @@ def confluence_score(client: Client, symbol: str) -> dict:
 
     verdict = "A+ SETUP" if score >= 8 else "Decent" if score >= 5 else "Skip"
 
-    # OTE filter info (informational on alert; enforced at trade open)
+    # OTE filter info + VSA reads (informational on alert; enforced at trade open)
     ote = None
+    vsa_ltf = None
+    vsa_mtf = None
     if direction:
         try:
             mtf_df = fetch_klines(client, symbol, "1h", 300)
+            ltf_df = fetch_klines(client, symbol, "15m", 300)
             ote = ote_check(direction, mtf_df, mtf["swings"], mtf.get("recent_sweep"),
                             ltf["current_price"])
+            vsa_ltf = vsa_signature(ltf_df, lookback=3)
+            vsa_mtf = vsa_signature(mtf_df, lookback=5)
         except Exception:
-            ote = None
+            pass
 
     return {
         "symbol": symbol.upper(),
@@ -765,6 +890,8 @@ def confluence_score(client: Client, symbol: str) -> dict:
         "ltf_trend": ltf["structure"]["trend"],
         "current_price": ltf["current_price"],
         "ote": ote,
+        "vsa_ltf": vsa_ltf,
+        "vsa_mtf": vsa_mtf,
     }
 
 

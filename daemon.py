@@ -608,6 +608,7 @@ OTE_TOP = float(os.getenv("DAEMON_OTE_TOP", 0.62))                  # SMC-orthod
 CEILING_LOOKBACK = int(os.getenv("DAEMON_CEILING_LOOKBACK", 160))   # 160 × 1H ≈ 6.7 days
 ENABLE_OTE_FILTER = os.getenv("DAEMON_ENABLE_OTE", "false").lower() == "true"      # off by default
 ENABLE_CEILING_FILTER = os.getenv("DAEMON_ENABLE_CEILING", "true").lower() == "true"
+ENABLE_VSA_FILTER = os.getenv("DAEMON_ENABLE_VSA", "false").lower() == "true"       # VSA up-thrust hard-reject; backtest regressed (-29% avgR), off by default
 
 
 def _tf_aligned(r: dict) -> bool:
@@ -681,8 +682,21 @@ def _suggest_levels(client: Client, symbol: str, direction: str, current_price: 
             log.info(f"{symbol}: rejected by ceiling filter ({tr.get('reason')})")
             return None
 
+    # VSA up-thrust hard-reject — smart-money distribution signature
+    vsa_info = None
+    if ENABLE_VSA_FILTER and direction == "long":
+        ltf_last = analysis.vsa_bar(ltf_df, len(ltf_df) - 1)
+        mtf_vsa = analysis.vsa_signature(mtf_df, lookback=5)
+        vsa_info = {"ltf_last": ltf_last, "mtf": mtf_vsa}
+        if ltf_last == "up_thrust":
+            log.info(f"{symbol}: rejected by VSA filter (LTF up_thrust on entry bar)")
+            return None
+        if mtf_vsa.get("has_up_thrust"):
+            log.info(f"{symbol}: rejected by VSA filter (recent MTF up_thrust)")
+            return None
+
     return {"entry": entry, "stop": stop, "target": target, "rr": TARGET_RR,
-            "ote": ote, "ceiling": tr}
+            "ote": ote, "ceiling": tr, "vsa": vsa_info}
 
 
 class SetupScannerJob(Job):

@@ -167,25 +167,36 @@ def gates_for_buy(verdict: dict, state: dict, client) -> tuple[bool, str]:
     # Pro-trader filters: late-entry (OTE) + target reachability.
     # Defense in depth — _suggest_levels already enforces these for setup_scan,
     # but whale-watch enqueues bypass that path, so re-check here.
-    # Ceiling filter (target-reachability) is on by default — backtest winner.
-    # OTE filter is off by default — backtest didn't support it.
-    if os.getenv("AGENT_ENABLE_CEILING", "true").lower() == "true" or \
-       os.getenv("AGENT_ENABLE_OTE", "false").lower() == "true":
+    # Ceiling filter (target-reachability) on by default — backtest winner.
+    # VSA up-thrust filter on by default — fakes are smart-money distribution.
+    # OTE filter off by default — backtest didn't support it.
+    enable_ceil = os.getenv("AGENT_ENABLE_CEILING", "true").lower() == "true"
+    enable_vsa  = os.getenv("AGENT_ENABLE_VSA",     "false").lower() == "true"
+    enable_ote  = os.getenv("AGENT_ENABLE_OTE",     "false").lower() == "true"
+    if enable_ceil or enable_vsa or enable_ote:
         try:
             import analysis  # local import to avoid hard dep at module load
             mtf_df = analysis.fetch_klines(client, sym, "1h", 300)
-            if os.getenv("AGENT_ENABLE_OTE", "false").lower() == "true":
+            ltf_df = analysis.fetch_klines(client, sym, "15m", 300) if enable_vsa else None
+            if enable_ote:
                 mtf_swings = analysis.detect_swings(mtf_df)
                 mtf_sweep = analysis.detect_sweep(mtf_df, mtf_swings)
                 ote_top = float(os.getenv("AGENT_OTE_TOP", "0.62"))
                 ote = analysis.ote_check("long", mtf_df, mtf_swings, mtf_sweep, entry, ote_top=ote_top)
                 if ote.get("valid") is False:
                     return False, f"OTE late-entry: {ote.get('reason')}"
-            if os.getenv("AGENT_ENABLE_CEILING", "true").lower() == "true":
+            if enable_ceil:
                 lookback = int(os.getenv("AGENT_CEILING_LOOKBACK", "160"))
                 tr = analysis.target_reachable("long", entry, target, mtf_df, lookback=lookback)
                 if not tr["reachable"]:
                     return False, f"target unreachable: {tr.get('reason')}"
+            if enable_vsa and ltf_df is not None:
+                ltf_last = analysis.vsa_bar(ltf_df, len(ltf_df) - 1)
+                if ltf_last == "up_thrust":
+                    return False, "VSA up_thrust on LTF entry bar (smart-money distribution)"
+                mtf_vsa = analysis.vsa_signature(mtf_df, lookback=5)
+                if mtf_vsa.get("has_up_thrust"):
+                    return False, "VSA up_thrust detected on recent MTF bars"
         except Exception as e:
             # If filter check itself fails, fail-open (don't block on data fetch failure)
             log.warning(f"agent filter check failed for {sym}: {e}")

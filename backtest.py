@@ -95,6 +95,8 @@ def run_backtest(
     ote_top: float = 0.62,          # retrace threshold (0.62 = SMC-orthodox top of OTE)
     ceiling_filter: bool = False,   # if True, reject if 1.5R target > recent N-bar MTF high
     ceiling_lookback: int = 96,     # MTF (1H) bars
+    vsa_filter: bool = False,       # if True, hard-reject entries on LTF up_thrust or recent MTF up_thrust
+    vsa_mtf_lookback: int = 5,
     track_filter_stats: bool = True,
 ) -> dict:
     symbol = symbol.upper()
@@ -113,7 +115,7 @@ def run_backtest(
     trades: list[SimTrade] = []
     open_trade: Optional[SimTrade] = None
     open_idx: int = -1
-    filter_stats = {"rejected_ote": 0, "rejected_ceiling": 0}
+    filter_stats = {"rejected_ote": 0, "rejected_ceiling": 0, "rejected_vsa_upthrust": 0}
 
     for i in range(warmup, len(ltf_df) - 1):
         bar = ltf_df.iloc[i]
@@ -255,6 +257,20 @@ def run_backtest(
                 filter_stats["rejected_ceiling"] += 1
                 continue
 
+        # ── filter: VSA up-thrust hard reject ──
+        # An up-thrust on the very last LTF bar OR within the last N MTF bars
+        # means smart money distributed into a high-volume new high. Don't
+        # take a long into that.
+        if vsa_filter and r["direction"] == "long":
+            ltf_last_sig = analysis.vsa_bar(ltf_slice, len(ltf_slice) - 1)
+            if ltf_last_sig == "up_thrust":
+                filter_stats["rejected_vsa_upthrust"] += 1
+                continue
+            mtf_vsa = analysis.vsa_signature(mtf_slice, lookback=vsa_mtf_lookback)
+            if mtf_vsa.get("has_up_thrust"):
+                filter_stats["rejected_vsa_upthrust"] += 1
+                continue
+
         open_trade = SimTrade(
             entry_time=ltf_df.index[i + 1].isoformat(),
             direction=r["direction"],
@@ -312,6 +328,7 @@ def run_backtest(
             "ote_top": ote_top,
             "ceiling_filter": ceiling_filter,
             "ceiling_lookback": ceiling_lookback,
+            "vsa_filter": vsa_filter,
         },
         "filter_stats": filter_stats,
         "period": {
