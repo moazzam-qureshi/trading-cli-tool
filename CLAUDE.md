@@ -364,6 +364,20 @@ The daemon spawns `claude -p` subprocesses to react to live events (score-9 setu
 - If the verdict is ambiguous → SKIP.
 - If trade.py buy/sell command itself fails → log to `#system-health`, SKIP.
 
+**OCO attach failure on auto-limit fill (naked-position recovery):**
+
+When `LimitFillMonitorJob._on_fill` fills a buy but `place_oco_sell` errors, the daemon does NOT page the user first. Recovery sequence:
+
+1. **Daemon retries OCO** 3× with 0s/2s/5s backoff. Catches transient API issues + balance-race (BNB fee deduction can leave free balance briefly off by a few sats). Most failures resolve here. On success after retry, posts INFO to `#system-health`.
+
+2. **If all 3 retries fail**, daemon enqueues `oco_recovery` event for the agent. Posts ERROR to `#system-health` noting the position is naked. The agent decides:
+   - `EMERGENCY_FLATTEN` (default / preferred): market-sell to close. A small slippage loss (~$0.03 on a $30 position) is far better than holding unprotected exposure overnight.
+   - `RETRY_OCO`: only when the error clearly indicates a price-rule violation (PERCENT_PRICE, MIN_NOTIONAL, NOTIONAL filter, tick/lot rounding) AND the agent proposes adjusted stop/target that keep R:R ≥ 1.0 and stay within ±30% of originals. If `execute_retry_oco` itself fails, daemon falls back to EMERGENCY_FLATTEN automatically.
+
+3. Both decisions post outcome to `#system-health`. User is paged only if the fallback flatten also fails — that's the genuinely unrecoverable case requiring manual intervention.
+
+`oco_recovery` and `position_review` are **PROTECT_TYPES** in `agent.run()`: they bypass the daily breaker / trade-cap drain. Caps prevent *opening new risk*, not closing existing risk. An open position needs protection regardless of how many times the agent traded today.
+
 **Notification:**
 - Every agent verdict (SHIP and SKIP both) posts to `#active-trade-signals` with full reasoning.
 - Every agent-placed trade also goes through the standard `trade_opened` and journal pipeline so it appears in `#trade-journal` like a manual trade.

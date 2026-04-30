@@ -557,20 +557,63 @@ class LimitFillMonitorJob(Job):
         target_d = trade_mod.round_step(D(str(intent["target"])), tick)
         stop_limit_d = trade_mod.round_step(D(str(intent["stop_limit"])), tick)
 
-        try:
-            oco = trade_mod.place_oco_sell(
-                client, symbol=sym,
-                quantity=trade_mod.fmt(qty_d, lot),
-                target=trade_mod.fmt(target_d, tick),
-                stop=trade_mod.fmt(stop_d, tick),
-                stop_limit=trade_mod.fmt(stop_limit_d, tick),
-            )
-            log.info(f"limit_monitor: OCO attached for {sym} (orderListId={oco.get('orderListId')})")
-        except Exception as e:
-            log.error(f"limit_monitor: OCO place FAILED for {sym}: {e}")
-            notify.send("signals",
-                        content=f"⚠️ **{sym}** LIMIT filled but OCO failed: {e}. "
-                                f"Run `trade.py protect {sym} --stop {intent['stop']} --target {intent['target']}` ASAP.")
+        # Retry OCO attach with backoff. Handles transient API issues + balance-race
+        # (BNB fee deduction can leave free balance briefly off by a few sats).
+        oco = None
+        last_err: Optional[Exception] = None
+        for attempt, delay in enumerate([0, 2, 5], start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                oco = trade_mod.place_oco_sell(
+                    client, symbol=sym,
+                    quantity=trade_mod.fmt(qty_d, lot),
+                    target=trade_mod.fmt(target_d, tick),
+                    stop=trade_mod.fmt(stop_d, tick),
+                    stop_limit=trade_mod.fmt(stop_limit_d, tick),
+                )
+                log.info(f"limit_monitor: OCO attached for {sym} on attempt {attempt} "
+                         f"(orderListId={oco.get('orderListId')})")
+                if attempt > 1:
+                    notify.system_alert(
+                        "INFO", f"OCO recovered on retry — {sym}",
+                        f"Attached on attempt {attempt}/3. Position is now protected.")
+                break
+            except Exception as e:
+                last_err = e
+                log.warning(f"limit_monitor: OCO attempt {attempt}/3 FAILED for {sym}: {e}")
+
+        if oco is None:
+            err_msg = str(last_err) if last_err else "unknown"
+            log.error(f"limit_monitor: OCO place FAILED after 3 retries for {sym}: {err_msg}")
+            try:
+                current_price = float(client.get_symbol_ticker(symbol=sym)["price"])
+            except Exception:
+                current_price = float(intent["limit_price"])
+            try:
+                avg_fill_for_recovery = float(D(order["cummulativeQuoteQty"]) / D(order["executedQty"]))
+            except Exception:
+                avg_fill_for_recovery = float(intent["limit_price"])
+            notify.system_alert(
+                "ERROR", f"OCO attach failed — {sym} naked",
+                f"All 3 retries failed. Last error: {err_msg[:300]}\n"
+                f"Filled qty: {float(qty_d)} @ ~${avg_fill_for_recovery}. "
+                f"Escalating to agent for RETRY_OCO or EMERGENCY_FLATTEN decision.")
+            claude_agent.enqueue_event(state, {
+                "symbol": sym,
+                "trigger": "oco_recovery",
+                "type": "oco_recovery",
+                "current_price": current_price,
+                "direction": "long",
+                "filled_qty": float(qty_d),
+                "fill_price": avg_fill_for_recovery,
+                "intended_stop": float(intent["stop"]),
+                "intended_target": float(intent["target"]),
+                "intended_stop_limit": float(intent["stop_limit"]),
+                "lot_step": str(lot),
+                "tick_step": str(tick),
+                "last_error": err_msg[:500],
+            })
             return
 
         # Compute average fill price for journal

@@ -292,7 +292,7 @@ Be concise — one paragraph of reasoning per layer is plenty.
 
 Required JSON schema:
 {
-  "decision": "BUY" | "SKIP" | "EARLY_EXIT" | "WATCH",
+  "decision": "BUY" | "SKIP" | "EARLY_EXIT" | "WATCH" | "RETRY_OCO" | "EMERGENCY_FLATTEN",
   "symbol": "...USDT",
   "direction": "LONG" | "SHORT",
   "score": <int 0-15>,
@@ -311,7 +311,8 @@ Required JSON schema:
   "watch_cvd_signal": "strong_distribution" | "net_distribution" | "strong_accumulation" | "net_accumulation" | null,
   "watch_sweep_printed": "bullish" | "bearish" | null,
   "watch_action": "reeval" | "notify",
-  "watch_expires_hours": <float, default 12, max 24>
+  "watch_expires_hours": <float, default 12, max 24>,
+  "stop_limit_retry": <float|null>
 }
 
 For SKIP, EARLY_EXIT, and WATCH, entry/stop/target/rr can be 0. Direction MUST be
@@ -377,13 +378,36 @@ def build_prompt(event: dict, chart_paths: dict, confluence_text: str) -> str:
             "\n- The prior thesis is *context*, not a green light. Run all 3 layers fresh — conditions may have decayed since the watch was set. Reject if the setup no longer holds."
         )
 
+    recovery_lines = ""
+    if event.get("type") == "oco_recovery":
+        recovery_lines = (
+            f"\n\n## ⚠️ OCO RECOVERY — different decision schema applies"
+            f"\nA limit-at-sweep BUY just filled but the daemon's OCO-attach failed 3 times in a row."
+            f"\nThe position is currently **NAKED** (no stop, no target). User is asleep."
+            f"\n\n- Filled qty: {event.get('filled_qty')}"
+            f"\n- Avg fill: ${event.get('fill_price')}"
+            f"\n- Intended stop: ${event.get('intended_stop')}"
+            f"\n- Intended target: ${event.get('intended_target')}"
+            f"\n- Intended stop-limit: ${event.get('intended_stop_limit')}"
+            f"\n- Current price: ${event.get('current_price')}"
+            f"\n- Last Binance error: {event.get('last_error','?')}"
+            f"\n\n**Your decision is `RETRY_OCO` or `EMERGENCY_FLATTEN` — do NOT use BUY/SKIP/EARLY_EXIT/WATCH for this event.**"
+            f"\n\n- `EMERGENCY_FLATTEN` (default / safer): market-sell to close the naked position. Use this whenever the error is ambiguous, unfixable, or you have any doubt. A small slippage loss is far better than holding unprotected exposure overnight."
+            f"\n- `RETRY_OCO` (only if clearly fixable): the error message indicates a price-rule violation (PERCENT_PRICE, MIN_NOTIONAL, NOTIONAL filter, tick/lot rounding) AND you can propose adjusted stop/target that:"
+            f"\n    * keep R:R ≥ 1.0 against the avg fill"
+            f"\n    * stay within ±30% of the original stop and target"
+            f"\n    * make sense given the current price"
+            f"\n  Put new prices in `stop`, `target`, `stop_limit_retry` (the stop-limit price for the OCO STOP_LOSS_LIMIT leg; default = stop × 0.998 for longs)."
+            f"\n\nBias strongly toward EMERGENCY_FLATTEN. We can always re-enter on a fresh setup; we cannot un-lose a runaway naked position."
+        )
+
     return PROMPT_HEADER + f"""
 
 ## Event
 - Symbol: {symbol}
 - Trigger: {trigger}
 - Current price: ${price}
-- Type: {event.get("type", "setup")}{whale_lines}{watch_lines}
+- Type: {event.get("type", "setup")}{whale_lines}{watch_lines}{recovery_lines}
 
 ## Layer 1 + Layer 2 (`confluence --whale` already-run output)
 ```
@@ -554,6 +578,73 @@ def execute_buy(verdict: dict, client, state: dict) -> tuple[bool, str]:
         return False, f"trade.py buy raised: {e}"
 
 
+def execute_emergency_flatten(symbol: str, client) -> tuple[bool, str]:
+    """Market-sell to close a naked position when OCO recovery isn't viable."""
+    sym = symbol.upper()
+    if DRY_RUN:
+        log.info(f"agent DRY-RUN: would EMERGENCY_FLATTEN {sym}")
+        return True, "dry-run logged"
+    cmd = ["python", "trade.py", "sell", sym, "--yes"]
+    try:
+        proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return False, f"trade.py sell rc={proc.returncode} stderr={proc.stderr[:400]}"
+        return True, proc.stdout[-400:]
+    except Exception as e:
+        return False, f"trade.py sell raised: {e}"
+
+
+def execute_retry_oco(verdict: dict, event: dict, client) -> tuple[bool, str]:
+    """Retry OCO attach with agent-adjusted stop/target. Validates R:R + bounds first."""
+    sym = verdict["symbol"].upper()
+    fill_price = float(event.get("fill_price") or 0)
+    orig_stop = float(event.get("intended_stop") or 0)
+    orig_target = float(event.get("intended_target") or 0)
+    new_stop = float(verdict.get("stop") or 0)
+    new_target = float(verdict.get("target") or 0)
+    new_stop_limit = float(verdict.get("stop_limit_retry") or 0) or (new_stop * 0.998)
+    qty = float(event.get("filled_qty") or 0)
+
+    if not (fill_price > 0 and new_stop > 0 and new_target > 0 and qty > 0):
+        return False, f"missing inputs (fill={fill_price} stop={new_stop} target={new_target} qty={qty})"
+    if not (new_stop < fill_price < new_target):
+        return False, f"invalid level ordering: stop {new_stop} < fill {fill_price} < target {new_target}"
+    risk = fill_price - new_stop
+    reward = new_target - fill_price
+    if risk <= 0 or reward / risk < 1.0:
+        return False, f"R:R {reward/risk:.2f} < 1.0 floor"
+    # Bound retry adjustments to ±30% of originals — anything wider means agent
+    # is fabricating levels, fall through to flatten.
+    if orig_stop and abs(new_stop - orig_stop) / orig_stop > 0.30:
+        return False, f"new stop {new_stop} > 30% off original {orig_stop}"
+    if orig_target and abs(new_target - orig_target) / orig_target > 0.30:
+        return False, f"new target {new_target} > 30% off original {orig_target}"
+
+    if DRY_RUN:
+        log.info(f"agent DRY-RUN: would RETRY_OCO {sym} stop={new_stop} target={new_target}")
+        return True, "dry-run logged"
+
+    from decimal import Decimal as D
+    import trade as trade_mod
+    lot = D(str(event.get("lot_step") or "0.0001"))
+    tick = D(str(event.get("tick_step") or "0.0001"))
+    qty_d = trade_mod.round_step(D(str(qty)), lot)
+    stop_d = trade_mod.round_step(D(str(new_stop)), tick)
+    target_d = trade_mod.round_step(D(str(new_target)), tick)
+    stop_limit_d = trade_mod.round_step(D(str(new_stop_limit)), tick)
+    try:
+        oco = trade_mod.place_oco_sell(
+            client, symbol=sym,
+            quantity=trade_mod.fmt(qty_d, lot),
+            target=trade_mod.fmt(target_d, tick),
+            stop=trade_mod.fmt(stop_d, tick),
+            stop_limit=trade_mod.fmt(stop_limit_d, tick),
+        )
+        return True, f"OCO attached (orderListId={oco.get('orderListId')}) stop={new_stop} target={new_target}"
+    except Exception as e:
+        return False, f"retry OCO failed: {e}"
+
+
 def execute_early_exit(verdict: dict, client) -> tuple[bool, str]:
     sym = verdict["symbol"].upper()
     if DRY_RUN:
@@ -579,7 +670,8 @@ def post_verdict(verdict: dict, gate_result: tuple[bool, str], action_result: Op
     """Rich Discord embed of what the agent decided and what happened."""
     decision = verdict.get("decision", "?")
     sym = verdict.get("symbol", "?")
-    color = {"BUY": "blue", "SKIP": "grey", "EARLY_EXIT": "yellow", "WATCH": "purple"}.get(decision, "purple")
+    color = {"BUY": "blue", "SKIP": "grey", "EARLY_EXIT": "yellow", "WATCH": "purple",
+             "RETRY_OCO": "yellow", "EMERGENCY_FLATTEN": "red"}.get(decision, "purple")
 
     fields = [
         {"name": "Decision", "value": decision, "inline": True},
@@ -727,14 +819,25 @@ class ClaudeAgentJob:
             return
 
         d = _agent_daily(state)
+        # Caps drain *new-trade* events but preserve recovery + position-review events,
+        # which protect existing exposure rather than open new risk.
+        PROTECT_TYPES = {"oco_recovery", "position_review"}
         if d["breaker_tripped"]:
-            log.info("agent: breaker tripped, draining queue without action")
-            state["agent_queue"] = []
-            return
+            kept = [e for e in queue if e.get("type") in PROTECT_TYPES]
+            if len(kept) < len(queue):
+                log.info(f"agent: breaker tripped, dropped {len(queue)-len(kept)} new-trade events, kept {len(kept)} protect events")
+            state["agent_queue"] = kept
+            queue = kept
+            if not queue:
+                return
         if d["trades_opened"] >= DAILY_TRADE_CAP:
-            log.info(f"agent: daily cap {d['trades_opened']}/{DAILY_TRADE_CAP} hit, draining queue")
-            state["agent_queue"] = []
-            return
+            kept = [e for e in queue if e.get("type") in PROTECT_TYPES]
+            if len(kept) < len(queue):
+                log.info(f"agent: daily cap hit, dropped {len(queue)-len(kept)} new-trade events, kept {len(kept)} protect events")
+            state["agent_queue"] = kept
+            queue = kept
+            if not queue:
+                return
 
         event = queue.pop(0)
         # Persist queue mutation immediately so a crash doesn't replay
@@ -831,6 +934,35 @@ class ClaudeAgentJob:
             )
             action_result = (ok, f"watch added (id={watch['id'][:8]})" if ok else f"watch rejected: {reason}")
             post_verdict(verdict, (True, "watch path"), action_result)
+        elif decision == "EMERGENCY_FLATTEN":
+            sym = verdict.get("symbol", "").upper()
+            action_result = execute_emergency_flatten(sym, client)
+            ok, msg = action_result
+            notify.system_alert(
+                "WARN" if ok else "ERROR",
+                f"OCO recovery → EMERGENCY_FLATTEN {sym}",
+                f"{'Flattened' if ok else 'FLATTEN FAILED'}: {msg[:400]}\n"
+                f"Reason: {verdict.get('reasoning','')[:300]}")
+            post_verdict(verdict, (True, "oco_recovery flatten path"), action_result)
+        elif decision == "RETRY_OCO":
+            sym = verdict.get("symbol", "").upper()
+            action_result = execute_retry_oco(verdict, self.current_event or {}, client)
+            ok, msg = action_result
+            notify.system_alert(
+                "INFO" if ok else "ERROR",
+                f"OCO recovery → RETRY_OCO {sym}",
+                f"{'Recovered' if ok else 'RETRY FAILED — position still naked, manual intervention needed'}: {msg[:400]}")
+            if not ok:
+                # Retry failed — fall back to flatten so we don't leave a naked position
+                log.warning(f"agent: RETRY_OCO failed for {sym}, falling back to EMERGENCY_FLATTEN")
+                fallback = execute_emergency_flatten(sym, client)
+                fb_ok, fb_msg = fallback
+                notify.system_alert(
+                    "WARN" if fb_ok else "ERROR",
+                    f"OCO recovery → fallback FLATTEN {sym}",
+                    f"{'Flattened after retry failed' if fb_ok else 'FLATTEN ALSO FAILED — page user'}: {fb_msg[:400]}")
+                action_result = fallback
+            post_verdict(verdict, (True, "oco_recovery retry path"), action_result)
         elif decision == "EARLY_EXIT":
             # Only honored on position-review events; check there's an open position
             sym = verdict.get("symbol", "").upper()
