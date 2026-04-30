@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 import notify
+import agent_watch
 
 log = logging.getLogger("daemon")
 
@@ -219,7 +220,7 @@ Be concise — one paragraph of reasoning per layer is plenty.
 
 Required JSON schema:
 {
-  "decision": "BUY" | "SKIP" | "EARLY_EXIT",
+  "decision": "BUY" | "SKIP" | "EARLY_EXIT" | "WATCH",
   "symbol": "...USDT",
   "direction": "LONG" | "SHORT",
   "score": <int 0-15>,
@@ -231,16 +232,27 @@ Required JSON schema:
   "target": <float>,
   "rr": <float>,
   "reasoning": "<≤500 chars why this verdict>",
-  "primary_concern": "<≤200 chars what could invalidate this>"
+  "primary_concern": "<≤200 chars what could invalidate this>",
+  "watch_price_lte": <float|null>,
+  "watch_price_gte": <float|null>,
+  "watch_expires_hours": <float, default 12, max 24>
 }
 
-For SKIP and EARLY_EXIT, entry/stop/target/rr can be 0. Direction MUST be "LONG"
-for any BUY (spot-only — no shorts).
+For SKIP, EARLY_EXIT, and WATCH, entry/stop/target/rr can be 0. Direction MUST be
+"LONG" for any BUY or WATCH (spot-only — no shorts).
 
 Decision rules:
 - BUY only if all three layers pass AND R:R ≥ 1.5 AND clean LTF structure.
-- SKIP if any layer rejects, or if levels don't give clean R:R, or if pumped/distributing.
+- SKIP if the setup is fundamentally broken (wrong direction, distribution, no edge).
 - EARLY_EXIT only used on position-review events where the open trade's setup is invalidated.
+- WATCH when Layers 1-2 are strong but Layer 3 (visual) rejects current entry as a
+  chase / late-rally / round-number trap, AND there is a specific price level that
+  would resolve the visual concern (e.g. pullback into the prior sweep low or 1h
+  EMA support). Set watch_price_lte to that pullback price for longs (or
+  watch_price_gte for breakout-confirmation re-eval). The daemon will re-run a full
+  3-layer eval automatically when price hits that level. Use this INSTEAD of SKIP
+  whenever the setup is "right symbol, wrong price" — exactly the scenario where a
+  pro trader would set a price alert and walk away.
 """
 
 
@@ -258,13 +270,23 @@ def build_prompt(event: dict, chart_paths: dict, confluence_text: str) -> str:
     if event.get("whale_triggers"):
         whale_lines = "\n- Whale triggers: " + ", ".join(event["whale_triggers"])
 
+    watch_lines = ""
+    if event.get("type") == "watch_triggered":
+        watch_lines = (
+            f"\n\n## Re-eval context (this is a previously-set agent watch firing)"
+            f"\n- Original thesis (from prior eval): {event.get('original_thesis','')[:500]}"
+            f"\n- Original trigger: {event.get('original_trigger','')}"
+            f"\n- Watch fired by: price {event.get('triggered_by','?')} @ ${event.get('triggered_price','?')}"
+            "\n- The previous SKIP/WATCH was based on visual rejection at a different price. Run all 3 layers fresh — the prior thesis is context, not a green light."
+        )
+
     return PROMPT_HEADER + f"""
 
 ## Event
 - Symbol: {symbol}
 - Trigger: {trigger}
 - Current price: ${price}
-- Type: {event.get("type", "setup")}{whale_lines}
+- Type: {event.get("type", "setup")}{whale_lines}{watch_lines}
 
 ## Layer 1 + Layer 2 (`confluence --whale` already-run output)
 ```
@@ -442,7 +464,7 @@ def post_verdict(verdict: dict, gate_result: tuple[bool, str], action_result: Op
     """Rich Discord embed of what the agent decided and what happened."""
     decision = verdict.get("decision", "?")
     sym = verdict.get("symbol", "?")
-    color = {"BUY": "blue", "SKIP": "grey", "EARLY_EXIT": "yellow"}.get(decision, "purple")
+    color = {"BUY": "blue", "SKIP": "grey", "EARLY_EXIT": "yellow", "WATCH": "purple"}.get(decision, "purple")
 
     fields = [
         {"name": "Decision", "value": decision, "inline": True},
@@ -456,6 +478,14 @@ def post_verdict(verdict: dict, gate_result: tuple[bool, str], action_result: Op
             {"name": "Target", "value": f"${verdict.get('target')}", "inline": True},
             {"name": "R:R", "value": f"{verdict.get('rr', 0):.2f}", "inline": True},
         ])
+    elif decision == "WATCH":
+        cond_parts = []
+        if verdict.get("watch_price_lte"):
+            cond_parts.append(f"≤ ${verdict['watch_price_lte']}")
+        if verdict.get("watch_price_gte"):
+            cond_parts.append(f"≥ ${verdict['watch_price_gte']}")
+        fields.append({"name": "Watch trigger", "value": " or ".join(cond_parts) or "?", "inline": True})
+        fields.append({"name": "Expires", "value": f"{verdict.get('watch_expires_hours', 12)}h", "inline": True})
 
     allowed, gate_msg = gate_result
     fields.append({"name": "Gate", "value": ("✅ " if allowed else "❌ ") + gate_msg, "inline": False})
@@ -663,6 +693,21 @@ class ClaudeAgentJob:
             else:
                 action_result = (False, f"gate rejected: {reason}")
             post_verdict(verdict, (allowed, reason), action_result)
+        elif decision == "WATCH":
+            sym = verdict.get("symbol", "").upper()
+            price_lte = verdict.get("watch_price_lte")
+            price_gte = verdict.get("watch_price_gte")
+            expires_h = verdict.get("watch_expires_hours") or 12
+            ok, reason, watch = agent_watch.add_watch(
+                state, sym,
+                price_lte=float(price_lte) if price_lte else None,
+                price_gte=float(price_gte) if price_gte else None,
+                expires_in_hours=float(expires_h),
+                thesis=verdict.get("reasoning", "")[:500],
+                original_trigger=(self.current_event or {}).get("trigger", ""),
+            )
+            action_result = (ok, f"watch added (id={watch['id'][:8]})" if ok else f"watch rejected: {reason}")
+            post_verdict(verdict, (True, "watch path"), action_result)
         elif decision == "EARLY_EXIT":
             # Only honored on position-review events; check there's an open position
             sym = verdict.get("symbol", "").upper()

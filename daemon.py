@@ -1112,6 +1112,50 @@ class WhaleWatchJob(Job):
         log.info(f"whale_watch: scanned {len(symbols)} symbols, sent {alerts_sent} alerts")
 
 
+import agent_watch  # noqa: E402
+
+
+class AgentWatchJob(Job):
+    """Polls agent-set price watches; re-invokes the agent when conditions hit."""
+    name = "agent_watch"
+
+    def __init__(self):
+        super().__init__()
+        self.interval = int(os.getenv("DAEMON_AGENT_WATCH_INTERVAL", 180))
+
+    def run(self, ctx: dict) -> None:
+        client: Client = ctx["client"]
+        state: dict = ctx["state"]
+        try:
+            triggered = agent_watch.evaluate_watches(client, state)
+        except Exception as e:
+            log.warning(f"agent_watch: evaluate failed: {e}")
+            return
+
+        for w in triggered:
+            sym = w["symbol"]
+            log.info(f"agent_watch: {sym} hit @ ${w['triggered_price']} (set {time.strftime('%H:%M', time.gmtime(w['set_at_ts']))} UTC)")
+            try:
+                notify.send("signals",
+                            content=f"⏰ Watch triggered — **{sym}** @ ${w['triggered_price']} ({w['triggered_by']} bound). Re-evaluating with full 3-layer filter…")
+            except Exception:
+                pass
+            claude_agent.enqueue_event(state, {
+                "symbol": sym,
+                "trigger": f"watch_triggered_{w['triggered_by']}",
+                "type": "watch_triggered",
+                "current_price": w["triggered_price"],
+                "direction": "long",
+                "original_thesis": w.get("thesis", ""),
+                "original_trigger": w.get("original_trigger", ""),
+                "triggered_by": w["triggered_by"],
+                "triggered_price": w["triggered_price"],
+            })
+
+        if triggered or agent_watch.list_watches(state):
+            save_state(state)
+
+
 class StartupJob(Job):
     name = "startup"
     interval = 10**9  # never repeats
@@ -1167,6 +1211,7 @@ def main() -> None:
         LimitFillMonitorJob(),
         SetupScannerJob(),
         WhaleWatchJob(),
+        AgentWatchJob(),
         DailyReportJob(),
         claude_agent.ClaudeAgentJob(),
     ]
