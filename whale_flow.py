@@ -296,3 +296,36 @@ def whale_bonus_stars(flow: dict, direction: str) -> tuple[int, list[str]]:
             reasons.append(f"⭐ Large-trade net sell ${net:,.0f} / 1h")
 
     return min(bonus, 4), reasons
+
+
+LARGE_NET_SELL_EXIT_USDT = 100_000
+
+
+def contradiction_triggers(flow: dict, direction: str) -> list[str]:
+    """Doctrine-defined exit-bar triggers for an OPEN position.
+
+    Bar is more sensitive than WhaleWatchJob discovery (net_* counts, not just
+    strong_*). Empty list = flow does not contradict the open trade.
+    """
+    if direction != "long":
+        return []
+
+    triggers: list[str] = []
+
+    cvd = flow.get("spot_cvd_4h")
+    if cvd:
+        sig = cvd.get("interpretation")
+        if sig in ("strong_distribution", "net_distribution"):
+            triggers.append(f"cvd_{sig}")
+
+    funding = flow.get("funding")
+    if funding and funding.get("interpretation") == "deeply_positive_retail_long":
+        triggers.append("funding_deeply_positive_retail_long")
+
+    large = flow.get("large_trades_1h")
+    if large and large.get("total_large_trades", 0) > 0:
+        net = large.get("net_notional_usdt", 0)
+        if net <= -LARGE_NET_SELL_EXIT_USDT:
+            triggers.append("large_net_sell")
+
+    return triggers

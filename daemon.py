@@ -136,6 +136,8 @@ class PositionMonitorJob(Job):
         super().__init__()
         self.interval = int(os.getenv("DAEMON_POSITION_INTERVAL", 60))
         self.near_pct = float(os.getenv("DAEMON_NEAR_PCT", 0.4))
+        self.whale_check_interval = int(os.getenv("DAEMON_POSITION_WHALE_INTERVAL", 600))
+        self.whale_dedupe_hours = float(os.getenv("DAEMON_POSITION_WHALE_DEDUPE_HOURS", 4))
 
     def run(self, ctx: dict) -> None:
         client: Client = ctx["client"]
@@ -226,6 +228,33 @@ class PositionMonitorJob(Job):
                 ps["last_structure"] = cur
             except Exception as e:
                 log.warning(f"{sym} structure check failed: {e}")
+
+            # Per-position whale-flow contradiction check (doctrine: same signal
+            # that would reject entry is sufficient to exit). More sensitive bar
+            # than WhaleWatchJob — net_* counts, not just strong_*.
+            last_whale_check = ps.get("last_whale_check", 0)
+            if time.time() - last_whale_check >= self.whale_check_interval:
+                try:
+                    flow = whale_flow.whale_flow_summary(client, sym)
+                    triggers = whale_flow.contradiction_triggers(flow, "long")
+                    ps["last_whale_check"] = time.time()
+                    seen = ps.setdefault("whale_trigger_seen", {})
+                    dedupe_window = self.whale_dedupe_hours * 3600
+                    fresh = [t for t in triggers if (time.time() - seen.get(t, 0)) > dedupe_window]
+                    if fresh:
+                        log.info(f"{sym} whale contradiction: {fresh} → enqueue position_review")
+                        claude_agent.enqueue_event(state, {
+                            "symbol": sym,
+                            "trigger": f"whale_contradiction_{','.join(fresh)[:80]}",
+                            "type": "position_review",
+                            "current_price": price,
+                            "direction": "long",
+                            "whale_triggers": fresh,
+                        })
+                        for t in fresh:
+                            seen[t] = time.time()
+                except Exception as e:
+                    log.warning(f"{sym} whale check failed: {e}")
 
             # Heartbeat
             hb_minutes = int(os.getenv("DAEMON_HEARTBEAT_MINUTES", 30))
