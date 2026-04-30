@@ -254,9 +254,10 @@ charting.py     — mplfinance candlestick charts with SMC overlays
 backtest.py     — vectorized historical backtest
 journal.py      — trade journaling (CSV + Discord)
 notify.py       — Discord webhook router (6 channels)
-daemon.py       — long-running daemon (Position, PartialTP, Setup scan, WhaleWatch, Daily report)
+daemon.py       — long-running daemon (Position, PartialTP, Setup scan, WhaleWatch, AgentWatch, Daily report)
 display.py      — rich terminal output
 risk.py         — daily-loss circuit breaker + position sizing
+agent_watch.py  — agent-set price watches (conditional re-eval when price hits a level)
 Dockerfile / docker-compose.yml — container deploy
 ```
 
@@ -311,6 +312,7 @@ The daemon spawns `claude -p` subprocesses to react to live events (score-9 setu
 - Place a `BUY` + OCO order on a symbol that passes all 3 layers (numerical score ≥9, whale-flow not contradicting direction, visual chart read confirms).
 - Issue an early market `SELL` on an open position when its analysis reads the setup as invalidated (e.g., whale flow flips, structure breaks down before stop hit).
 - Re-enter the same symbol once per day after a stop-out, only if a *fresh* score-9 setup forms (not the same setup that just failed).
+- **Set a price WATCH** on a symbol where Layers 1-2 are strong but Layer 3 (visual) rejects the *current* entry as a chase / late-rally / round-number trap, AND there is a specific price level that would resolve the visual concern (e.g. retest of the swept low, or a 1h EMA pullback). Emitted as `decision: "WATCH"` with `watch_price_lte` (long pullback) or `watch_price_gte` (breakout confirmation) and `watch_expires_hours`. The daemon's `AgentWatchJob` polls every 3min and re-runs a fresh full 3-layer eval when price hits the level — the prior thesis is passed in as context, not as a green light. Replaces the SKIP path whenever the situation is "right symbol, wrong price." Caps: 10 active watches, 24h max expiry, 12h default; same-symbol same-direction adds replace the prior watch; triggered watches are one-shot.
 
 **What the agent CANNOT do:**
 - Modify the OCO stop price (no trailing, BE-move, tightening, widening).
@@ -338,7 +340,7 @@ The daemon spawns `claude -p` subprocesses to react to live events (score-9 setu
 - Every agent-placed trade also goes through the standard `trade_opened` and journal pipeline so it appears in `#trade-journal` like a manual trade.
 
 **Operational scope of the agent:**
-- Triggers: SetupScannerJob (score ≥9 fresh setups) and WhaleWatchJob (whale triggers on existing or new symbols). PositionMonitorJob will also enqueue an adverse-signal review when an open position's structure flips against it.
+- Triggers: SetupScannerJob (score ≥9 fresh setups), WhaleWatchJob (whale triggers on existing or new symbols), AgentWatchJob (price-watch fires that the agent itself set on a prior eval), and PositionMonitorJob (adverse-structure or whale-contradiction review on open positions).
 - Daily budget: max 5 analyses/trades. Hard cap to prevent runaway loops.
 - Tool access for the spawned claude: **Read-only**. Reads pre-rendered chart PNGs and the prompt context. Cannot invoke trade.py buy/sell — those are called by the daemon AFTER validating the verdict.
 
