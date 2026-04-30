@@ -275,6 +275,11 @@ The daemon runs in Docker on a Hetzner VPS:
 - Path: `~/trading-cli-tool`
 - Update flow: `git pull && docker compose up -d --build`
 
+**You (Claude) operate directly on the VPS.** This working directory IS the production deployment — there is no separate dev machine. `hostname` returns `moazzam-vps`. Consequences:
+- Code edits land on prod the moment you save them, but the running daemon uses the **baked image**, not the host files. After any `.py` change, you must `docker compose up -d --build` for the daemon to pick it up. Just editing files does nothing to the live behavior.
+- Don't tell the user to "tailscale ssh moazzam-vps and pull" — you're already there. Commit locally, rebuild locally.
+- `docker compose exec trade-cli ...` runs against the current image — verify rebuilds took effect by checking behavior, not by re-reading the source.
+
 ### Discord Channel Architecture
 
 6 channels via webhooks in `.env`:

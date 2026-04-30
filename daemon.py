@@ -898,6 +898,8 @@ class SetupScannerJob(Job):
         tradeable: list[dict] = []
         watching: list[dict] = []
         for sym in symbols:
+            if claude_agent._is_excluded_symbol(sym):
+                continue
             try:
                 r = analysis.confluence_score(client, sym)
             except Exception as e:
@@ -1098,6 +1100,8 @@ class WhaleWatchJob(Job):
 
         alerts_sent = 0
         for sym in symbols:
+            if claude_agent._is_excluded_symbol(sym):
+                continue
             try:
                 flow = whale_flow.whale_flow_summary(client, sym)
                 fields, triggers = self._trigger_fields(flow)

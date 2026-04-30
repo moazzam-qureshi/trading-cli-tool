@@ -50,7 +50,9 @@ RR_FLOOR = float(os.getenv("AGENT_RR_FLOOR", 1.5))
 SUBPROCESS_TIMEOUT_SEC = int(os.getenv("AGENT_TIMEOUT_SEC", 300))
 DRY_RUN = os.getenv("AGENT_DRY_RUN", "false").lower() == "true"
 
-STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "RLUSD", "PYUSD"}
+STABLECOINS = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "RLUSD", "PYUSD",
+               "USD1", "USDD", "USDP", "USDE", "USDS", "USD0", "USDX", "USDY",
+               "EUR", "EURI", "EURS", "AEUR", "FDUSD", "GUSD", "LUSD", "USTC"}
 
 
 def _today_utc() -> str:
@@ -114,6 +116,11 @@ def _is_excluded_symbol(symbol: str) -> Optional[str]:
     base = s[:-4]
     if base in STABLECOINS:
         return "stablecoin pair"
+    # Defensive: catch USD-pegged variants we haven't enumerated (USD1, USD2, USDx…).
+    # Any base of the form USD followed by 1-2 alphanumerics is overwhelmingly a peg
+    # in practice; no legitimate alt we'd trade matches this pattern.
+    if len(base) <= 5 and base.startswith("USD"):
+        return "stablecoin pair (USD-pegged)"
     return None
 
 
