@@ -710,6 +710,18 @@ def _try_auto_limit_at_sweep(client: Client, state: dict, r: dict) -> tuple[bool
     except Exception as e:
         log.warning(f"auto-limit correlation check failed: {e}")
 
+    # Layer 2 — whale-flow contradiction check (mirrors the gate the agent path runs
+    # and PositionMonitorJob's open-position monitor). Closes the "score 9 with hidden
+    # distribution" gap that the LTC 2026-04-29 trade exposed. Layer 3 (visual) is
+    # mechanically substituted by the LIMIT-at-sweep entry pattern.
+    try:
+        flow = whale_flow.whale_flow_summary(client, sym)
+        triggers = whale_flow.contradiction_triggers(flow, "long")
+        if triggers:
+            return False, f"whale-flow contradiction at placement: {','.join(triggers)}"
+    except Exception as e:
+        log.warning(f"auto-limit whale-flow check failed: {e}")  # fail-open
+
     pending = state.setdefault("limit_intents", {})
     if len(pending) >= AUTO_LIMIT_MAX_PENDING:
         return False, f"max pending limits reached ({len(pending)}/{AUTO_LIMIT_MAX_PENDING})"
