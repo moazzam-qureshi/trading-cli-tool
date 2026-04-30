@@ -1138,10 +1138,17 @@ class AgentWatchJob(Job):
             kind = w["triggered_by"]
             value = w.get("triggered_value")
             price = w.get("triggered_price")
-            price_str = f"${price}" if price is not None else "?"
+            if price is None:
+                price_str = "?"
+            elif price < 0.01:
+                price_str = f"${price:.8f}".rstrip("0").rstrip(".")
+            elif price < 1:
+                price_str = f"${price:.6f}".rstrip("0").rstrip(".")
+            else:
+                price_str = f"${price:,.4f}".rstrip("0").rstrip(".")
             log.info(f"agent_watch: {sym} hit ({kind}={value}, action={action}) @ {price_str}")
             try:
-                tail = "Re-evaluating with full 3-layer filter…" if action == "reeval" else "Notify-only — no re-eval."
+                tail = "Re-evaluating with full 3-layer filter." if action == "reeval" else "Notify-only — no re-eval."
                 notify.send("signals",
                             content=f"⏰ Watch triggered — **{sym}** {kind}={value} (price {price_str}). {tail}")
             except Exception:
